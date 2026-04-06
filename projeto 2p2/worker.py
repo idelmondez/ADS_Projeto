@@ -77,11 +77,9 @@ def eleicao():
         except:
             continue
 
-    # inclui ele mesmo
     meu_espaco = get_espaco_livre()
     candidatos.append((("self", 2003), meu_espaco))
 
-    # escolhe maior
     novo_master = max(candidatos, key=lambda x: x[1])[0]
 
     print(f"[ELEIÇÃO] Novo master: {novo_master}")
@@ -124,7 +122,6 @@ def iniciar_master_local():
         threading.Thread(target=handle_client, args=(conn, addr)).start()
 
 
-# LOOP PRINCIPAL
 while True:
     enviar_heartbeat()
     time.sleep(5)
