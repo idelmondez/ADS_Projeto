@@ -5,7 +5,6 @@ import shutil
 
 HOST = '10.62.206.17'
 PORT = 2003
-SERVER_UUID = HOST
 
 
 def get_espaco_livre():
@@ -16,26 +15,32 @@ def get_espaco_livre():
 def handle_client(conn, addr):
     try:
         data = conn.recv(1024).decode().strip()
+
         if not data:
             return
 
         mensagem = json.loads(data)
 
+        print(f"\n[CONEXÃO] {addr}")
+
         if mensagem.get("TASK") == "HEARTBEAT":
+            print("[HEARTBEAT] de", addr)
+
             resposta = {
-                "SERVER_UUID": SERVER_UUID,
                 "TASK": "HEARTBEAT",
                 "RESPONSE": "ALIVE"
             }
 
         elif mensagem.get("TASK") == "DISK":
+            print("[DISK] consulta de", addr)
+
             resposta = {
-                "SERVER_UUID": SERVER_UUID,
-                "TASK": "DISK",
                 "FREE": get_espaco_livre()
             }
 
         elif mensagem.get("TASK") == "NEW_MASTER":
+            print("[INFO] Novo master anunciado:", mensagem.get("MASTER"))
+
             resposta = {"STATUS": "ACK"}
 
         else:
@@ -44,25 +49,21 @@ def handle_client(conn, addr):
         conn.sendall((json.dumps(resposta) + "\n").encode())
 
     except Exception as e:
-        print("Erro:", e)
+        print("[ERRO]", e)
 
     finally:
         conn.close()
+        print("[DESCONECTADO]", addr)
 
 
-def iniciar_master(host):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    server.bind((host, PORT))
-    server.listen(5)
+server.bind((HOST, PORT))
+server.listen()
 
-    print(f"[MASTER] Rodando em {host}:{PORT}")
+print(f"\n🔥 MASTER rodando em {HOST}:{PORT}\n")
 
-    while True:
-        conn, addr = server.accept()
-        threading.Thread(target=handle_client, args=(conn, addr)).start()
-
-
-if __name__ == "__main__":
-    iniciar_master(HOST)
+while True:
+    conn, addr = server.accept()
+    threading.Thread(target=handle_client, args=(conn, addr)).start()
