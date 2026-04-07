@@ -2,7 +2,7 @@ import socket
 import json
 import time
 import shutil
-import threading
+import master  # IMPORTANTE
 
 MEU_IP = '10.62.206.12'  # ALTERE EM CADA MÁQUINA
 PORT = 2003
@@ -77,10 +77,8 @@ def eleicao():
         except:
             continue
 
-    # inclui ele mesmo
     candidatos.append((MEU_IP, get_espaco_livre()))
 
-    # maior disco + desempate por IP
     novo_master_ip = max(candidatos, key=lambda x: (x[1], x[0]))[0]
 
     MASTER = (novo_master_ip, PORT)
@@ -89,7 +87,7 @@ def eleicao():
 
     if novo_master_ip == MEU_IP:
         anunciar_master()
-        iniciar_master_local()
+        iniciar_master()
 
 
 def anunciar_master():
@@ -112,53 +110,11 @@ def anunciar_master():
             continue
 
 
-def iniciar_master_local():
-    def handle_client(conn, addr):
-        try:
-            data = conn.recv(1024).decode().strip()
-            mensagem = json.loads(data)
+def iniciar_master():
+    print("🔥 ESTE NÓ AGORA É O MASTER!")
 
-            print(f"\n[CONEXÃO] {addr}")
+    master.iniciar_master(MEU_IP, PORT)
 
-            if mensagem.get("TASK") == "HEARTBEAT":
-                print("[HEARTBEAT] de", addr)
-                resposta = {"TASK": "HEARTBEAT", "RESPONSE": "ALIVE"}
-
-            elif mensagem.get("TASK") == "DISK":
-                resposta = {"FREE": get_espaco_livre()}
-
-            elif mensagem.get("TASK") == "NEW_MASTER":
-                global MASTER
-                MASTER = (mensagem["MASTER"], PORT)
-                print("[ATUALIZAÇÃO] Novo master:", MASTER)
-                resposta = {"STATUS": "ACK"}
-
-            else:
-                resposta = {"RESPONSE": "INVALID"}
-
-            conn.sendall((json.dumps(resposta) + "\n").encode())
-
-        except Exception as e:
-            print("[ERRO]", e)
-
-        finally:
-            conn.close()
-            print("[DESCONECTADO]", addr)
-
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    server.bind((MEU_IP, PORT))
-    server.listen()
-
-    print(f"\n🔥 ESTE NÓ AGORA É O MASTER ({MEU_IP})\n")
-
-    while True:
-        conn, addr = server.accept()
-        threading.Thread(target=handle_client, args=(conn, addr)).start()
-
-
-# LOOP
 while True:
     enviar_heartbeat()
     time.sleep(5)

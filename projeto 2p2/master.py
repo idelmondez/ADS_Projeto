@@ -3,9 +3,6 @@ import json
 import threading
 import shutil
 
-HOST = '10.62.206.17'
-PORT = 2003
-
 
 def get_espaco_livre():
     total, usado, livre = shutil.disk_usage("/")
@@ -25,7 +22,6 @@ def handle_client(conn, addr):
 
         if mensagem.get("TASK") == "HEARTBEAT":
             print("[HEARTBEAT] de", addr)
-
             resposta = {
                 "TASK": "HEARTBEAT",
                 "RESPONSE": "ALIVE"
@@ -33,14 +29,12 @@ def handle_client(conn, addr):
 
         elif mensagem.get("TASK") == "DISK":
             print("[DISK] consulta de", addr)
-
             resposta = {
                 "FREE": get_espaco_livre()
             }
 
         elif mensagem.get("TASK") == "NEW_MASTER":
             print("[INFO] Novo master anunciado:", mensagem.get("MASTER"))
-
             resposta = {"STATUS": "ACK"}
 
         else:
@@ -56,14 +50,19 @@ def handle_client(conn, addr):
         print("[DESCONECTADO]", addr)
 
 
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+def iniciar_master(host, port=2003):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-server.bind((HOST, PORT))
-server.listen()
+    server.bind((host, port))
+    server.listen(5)
 
-print(f"\n🔥 MASTER rodando em {HOST}:{PORT}\n")
+    print(f"\n🔥 MASTER rodando em {host}:{port}\n")
 
-while True:
-    conn, addr = server.accept()
-    threading.Thread(target=handle_client, args=(conn, addr)).start()
+    while True:
+        conn, addr = server.accept()
+        threading.Thread(target=handle_client, args=(conn, addr)).start()
+
+
+if __name__ == "__main__":
+    iniciar_master("10.62.206.17")
