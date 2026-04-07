@@ -3,16 +3,18 @@ import json
 import time
 import shutil
 
-MASTER = ("192.168.56.1", 2003)
+MEU_IP = '10.62.206.17' 
+PORT = 2003
 
 WORKERS = [
-    ("172.31.88.25", 2003),
-    ("172.31.88.26", 2003),
-    ("172.31.88.27", 2003),
+    ("10.62.206.17", 2003),
+    ("10.62.206.207", 2003),
 ]
 
-SERVER_UUID = "worker-01"
+MASTER = ("172.31.88.25", 2003)
+
 falhas = 0
+eleicao_em_andamento = False
 
 
 def get_espaco_livre():
@@ -21,27 +23,22 @@ def get_espaco_livre():
 
 
 def enviar_heartbeat():
-    global falhas
+    global falhas, eleicao_em_andamento
 
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(3)
         s.connect(MASTER)
 
-        payload = {
-            "SERVER_UUID": "master-01",
-            "TASK": "HEARTBEAT"
-        }
-
+        payload = {"TASK": "HEARTBEAT"}
         s.sendall((json.dumps(payload) + "\n").encode())
 
-        resposta = s.recv(1024).decode().strip()
+        resposta = s.recv(1024).decode()
 
         if resposta:
-            print("[OK] Master ativo")
+            print("[OK] Master ativo:", MASTER)
             falhas = 0
-        else:
-            falhas += 1
+            eleicao_em_andamento = False
 
         s.close()
 
@@ -49,7 +46,8 @@ def enviar_heartbeat():
         falhas += 1
         print(f"[ERRO] Falha {falhas}/4")
 
-    if falhas >= 4:
+    if falhas >= 4 and not eleicao_em_andamento:
+        eleicao_em_andamento = True
         eleicao()
 
 
@@ -70,25 +68,44 @@ def eleicao():
             s.sendall((json.dumps(payload) + "\n").encode())
 
             resposta = json.loads(s.recv(1024).decode())
-            candidatos.append((worker, resposta["FREE"]))
 
+            candidatos.append((worker[0], resposta["FREE"]))
             s.close()
 
         except:
             continue
 
-    meu_espaco = get_espaco_livre()
-    candidatos.append((("self", 2003), meu_espaco))
+    candidatos.append((MEU_IP, get_espaco_livre()))
 
-    novo_master = max(candidatos, key=lambda x: x[1])[0]
+    novo_master_ip = max(candidatos, key=lambda x: (x[1], x[0]))[0]
 
-    print(f"[ELEIÇÃO] Novo master: {novo_master}")
+    MASTER = (novo_master_ip, PORT)
 
-    if novo_master == ("self", 2003):
-        print("[MASTER] Eu sou o novo master!")
+    print("[ELEIÇÃO] Novo master:", MASTER)
+
+    if novo_master_ip == MEU_IP:
+        anunciar_master()
         iniciar_master_local()
-    else:
-        MASTER = novo_master
+
+
+def anunciar_master():
+    print("[MASTER] Anunciando novo master...")
+
+    for worker in WORKERS:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect(worker)
+
+            payload = {
+                "TASK": "NEW_MASTER",
+                "MASTER": MEU_IP
+            }
+
+            s.sendall((json.dumps(payload) + "\n").encode())
+            s.close()
+
+        except:
+            continue
 
 
 def iniciar_master_local():
@@ -99,23 +116,30 @@ def iniciar_master_local():
 
         if "HEARTBEAT" in data:
             resposta = {
-                "SERVER_UUID": "master-01",
                 "TASK": "HEARTBEAT",
                 "RESPONSE": "ALIVE"
             }
-            conn.sendall((json.dumps(resposta) + "\n").encode())
 
         elif "DISK" in data:
             resposta = {"FREE": get_espaco_livre()}
-            conn.sendall((json.dumps(resposta) + "\n").encode())
 
+        elif "NEW_MASTER" in data:
+            global MASTER
+            mensagem = json.loads(data)
+            MASTER = (mensagem["MASTER"], PORT)
+            resposta = {"STATUS": "ACK"}
+
+        else:
+            resposta = {"RESPONSE": "INVALID"}
+
+        conn.sendall((json.dumps(resposta) + "\n").encode())
         conn.close()
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("0.0.0.0", 2003))
+    server.bind((MEU_IP, PORT))
     server.listen()
 
-    print("[MASTER] Novo master iniciado!")
+    print("[MASTER] Este nó agora é o MASTER!")
 
     while True:
         conn, addr = server.accept()
