@@ -2,18 +2,16 @@ import socket
 import json
 import time
 import shutil
-import master  # IMPORTANTE
+import master
 
-MEU_IP = '10.62.206.12'  # ALTERE EM CADA MÁQUINA
+MEU_IP = "192.168.1.47"
 PORT = 2003
 
 WORKERS = [
-    ("10.62.206.12", 2003),
-    ("10.62.206.207", 2003),
-    ("10.62.206.17", 2003),
+    ("192.168.1.47", 2003),
 ]
 
-MASTER = ("10.62.206.17", 2003)
+MASTER = ("192.168.1.47", 2003)
 
 falhas = 0
 eleicao_em_andamento = False
@@ -24,29 +22,52 @@ def get_espaco_livre():
     return livre
 
 
-def enviar_heartbeat():
-    global falhas, eleicao_em_andamento
+def registrar():
+    try:
+        print("Registrando no master:", MASTER)
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect(MASTER)
+
+        payload = {
+            "TASK": "REGISTER",
+            "WORKER": MEU_IP
+        }
+
+        s.sendall((json.dumps(payload) + "\n").encode())
+        s.close()
+
+    except Exception as e:
+        print("Erro ao registrar:", e)
+
+
+def heartbeat():
+    global falhas, eleicao_em_andamento, MASTER
 
     try:
+        print("Heartbeat para:", MASTER)
+
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(3)
         s.connect(MASTER)
 
-        payload = {"TASK": "HEARTBEAT"}
+        payload = {
+            "TASK": "HEARTBEAT"
+        }
+
         s.sendall((json.dumps(payload) + "\n").encode())
 
         resposta = s.recv(1024).decode()
 
         if resposta:
-            print("[OK] Master ativo:", MASTER)
             falhas = 0
             eleicao_em_andamento = False
 
         s.close()
 
-    except:
+    except Exception as e:
         falhas += 1
-        print(f"[ERRO] Falha {falhas}/4 ao conectar em {MASTER}")
+        print("Falha:", falhas, e)
 
     if falhas >= 4 and not eleicao_em_andamento:
         eleicao_em_andamento = True
@@ -56,7 +77,7 @@ def enviar_heartbeat():
 def eleicao():
     global MASTER
 
-    print("\n🚨 Iniciando eleição...")
+    print("Iniciando eleição")
 
     candidatos = []
 
@@ -70,8 +91,8 @@ def eleicao():
             s.sendall((json.dumps(payload) + "\n").encode())
 
             resposta = json.loads(s.recv(1024).decode())
-
             candidatos.append((worker[0], resposta["FREE"]))
+
             s.close()
 
         except:
@@ -83,15 +104,15 @@ def eleicao():
 
     MASTER = (novo_master_ip, PORT)
 
-    print("🏆 Novo master eleito:", MASTER)
+    print("Novo master:", MASTER)
 
     if novo_master_ip == MEU_IP:
-        anunciar_master()
-        iniciar_master()
+        anunciar()
+        iniciar_master_local()
 
 
-def anunciar_master():
-    print("📢 Anunciando novo master...")
+def anunciar():
+    print("Anunciando novo master")
 
     for worker in WORKERS:
         try:
@@ -110,11 +131,13 @@ def anunciar_master():
             continue
 
 
-def iniciar_master():
-    print("🔥 ESTE NÓ AGORA É O MASTER!")
-
+def iniciar_master_local():
+    print("Este nó virou master")
     master.iniciar_master(MEU_IP, PORT)
 
+
+registrar()
+
 while True:
-    enviar_heartbeat()
-    time.sleep(5)
+    heartbeat()
+    time.sleep(3)
