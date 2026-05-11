@@ -27,6 +27,8 @@ eleicao_em_andamento = False
 # Quando estiver emprestado, guarda o master de origem para preencher SERVER_UUID.
 ORIGINAL_MASTER_ADDRESS = None
 
+local_master_thread = None
+local_master_stop_event = None
 state_lock = threading.Lock()
 
 
@@ -37,7 +39,6 @@ def log(msg):
 def get_espaco_livre():
     total, usado, livre = shutil.disk_usage("/")
     return livre
-
 
 def send_and_receive_json(server, payload, timeout=5):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -215,6 +216,29 @@ def tratar_comando_controle(mensagem):
             "payload": {"status": "ACK"},
         }
 
+    if msg_type == "announce_master":
+        master_addr = payload.get("master_address")
+        if master_addr and ":" in master_addr:
+            host, port_str = master_addr.rsplit(":", 1)
+            with state_lock:
+                MASTER = (host, int(port_str))
+            log(f"Announce recebido: novo master={MASTER}")
+            # se havia um master local, encerre-o
+            global local_master_thread, local_master_stop_event
+            if local_master_thread and local_master_thread.is_alive():
+                try:
+                    local_master_stop_event.set()
+                except Exception:
+                    pass
+                local_master_thread = None
+                local_master_stop_event = None
+
+        return {
+            "type": "announce_ack",
+            "request_id": request_id,
+            "payload": {"status": "ACK"},
+        }
+
     return {
         "type": "error",
         "request_id": request_id,
@@ -247,7 +271,11 @@ def controle_listener():
                 continue
 
             mensagem = json.loads(line)
-            resposta = tratar_comando_controle(mensagem)
+            # handler: support legacy DISK query and type-based control messages
+            if mensagem.get("TASK") == "DISK":
+                resposta = {"FREE": get_espaco_livre()}
+            else:
+                resposta = tratar_comando_controle(mensagem)
             conn.sendall((json.dumps(resposta) + "\n").encode())
 
         except Exception as e:

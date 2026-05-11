@@ -352,10 +352,9 @@ def monitor_saturation_loop():
         current_load = task_queue.qsize()
         if current_load > CAPACITY:
             log(f"Saturacao detectada: load={current_load} capacity={CAPACITY}")
-            for neighbor in NEIGHBORS:
-                response = request_help_from_neighbor(neighbor)
-                if response and response.get("type") == "response_accepted":
-                    break
+            # Sistema configurado para ter um unico master por vez. Neste modo
+            # nao tentamos negociar com outros masters; a escala horizontal via
+            # emprestimo de workers nao e suportada quando so existe um master.
         time.sleep(2)
 
 
