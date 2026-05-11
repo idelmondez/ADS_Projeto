@@ -1,100 +1,107 @@
-## Configuração
+## Projeto 2P2 - Atualizacoes Implementadas
 
-### No arquivo `master.py`
+Este projeto foi atualizado para alinhar com o documento `Projeto 2P2.pdf`.
 
-Defina o IP da máquina:
+## O que foi atualizado
+
+1. Sprint 1 (Heartbeat)
+- Worker envia `{"SERVER_UUID": "...", "TASK": "HEARTBEAT"}`.
+- Master responde `{"SERVER_UUID": "...", "TASK": "HEARTBEAT", "RESPONSE": "ALIVE"}`.
+- Todas as mensagens JSON seguem delimitador `\n` em TCP.
+
+1. Sprint 2 (Ciclo de tarefas)
+- Worker se apresenta com `WORKER=ALIVE` e `WORKER_UUID`.
+- Master entrega `QUERY` com `USER` ou `NO_TASK` quando fila vazia.
+- Worker processa e reporta `STATUS` (`OK` ou `NOK`) com `TASK=QUERY` e `WORKER_UUID`.
+- Master responde `ACK`.
+
+1. Sprint 3 (Master-to-Master)
+- Master suporta mensagens por `type` + `request_id` + `payload`.
+- Implementado receptor para:
+    - `request_help`
+    - `register_temporary_worker`
+    - `notify_worker_returned`
+- Worker suporta canal de controle para:
+    - `command_redirect`
+    - `command_release`
+
+## Configuracao
+
+Ajuste os enderecos em `master.py` e `worker.py`:
 
 ```python
-iniciar_master("192.168.1.47")
-```
-
----
-
-### No arquivo `worker.py`
-
-Configure:
-
-```python
-MEU_IP = "192.168.1.47"
-
-MASTER = ("192.168.1.47", 2003)
-
-WORKERS = [
-    ("192.168.1.47", 2003),
+# master.py
+SERVER_UUID = "Master_A"
+HOST = "10.62.134.143"
+PORT = 2003
+NEIGHBORS = [
+    ("Master_B", "192.168.1.48", 2003),
 ]
 ```
 
-Para múltiplas máquinas, adicione os IPs na lista `WORKERS`.
+```python
+# worker.py
+MEU_IP = "10.62.134.143"
+PORT = 2003
+CONTROL_PORT = 2103
+WORKER_UUID = "W-123"
+MASTER = ("10.62.134.143", 2003)
+MASTER_UUID = "Master_A"
+```
 
----
+## Execucao
 
-## Execução
-
-### 1. Iniciar o Master
-
-No terminal:
+1. Inicie o Master:
 
 ```bash
 python master.py
 ```
 
-Saída esperada:
-
-```plaintext
-MASTER ATIVO EM 192.168.1.47:2003
-```
-
----
-
-### 2. Iniciar o Worker
-
-Em outro terminal:
+1. Inicie o Worker em outro terminal:
 
 ```bash
 python worker.py
 ```
 
-Saída esperada:
+## Comportamento esperado
 
-```plaintext
-Registrando no master: ('192.168.1.47', 2003)
-Heartbeat para: ('192.168.1.47', 2003)
+- Heartbeat periodico do worker para o master.
+- Worker solicita tarefa com `ALIVE` e recebe `QUERY` ou `NO_TASK`.
+- Quando recebe `QUERY`, processa e reporta `STATUS`; em seguida recebe `ACK`.
+- Master loga origem do worker (local ou emprestado).
+- Estrutura de negociacao Master-to-Master pronta para interoperabilidade via `request_id`.
+
+## Compatibilidade
+
+- Fluxo legado de eleicao/failover (`DISK`, `NEW_MASTER`) foi mantido.
+- Mensagens com `type` desconhecido sao logadas e ignoradas sem derrubar processo.
+
+## Teste rápido (local)
+
+O teste abaixo foi executado localmente usando `127.0.0.1` como endpoint.
+
+- Comandos usados:
+
+```bash
+python master.py
+python worker.py
 ```
 
----
+- Trechos do log observado (Master):
 
-## Funcionamento
-
-* O worker envia heartbeat a cada 3 segundos
-* O master responde confirmando que está ativo
-* O worker se registra no master ao iniciar
-* O master mantém uma lista de workers ativos
-
----
-
-## Eleição de Novo Master
-
-Se o worker não conseguir se conectar ao master após 4 tentativas:
-
-* Inicia o processo de eleição
-* Consulta o espaço livre de disco dos nós
-* Escolhe o nó com maior espaço disponível
-* Em caso de empate, usa o IP como critério
-* O novo master é anunciado para os demais nós
-* O nó eleito assume o papel de master
-
----
-
-## Teste de Failover
-
-1. Inicie o master
-2. Inicie o worker
-3. Encerre o master (`Ctrl + C`)
-4. Observe no worker:
-
-```plaintext
-Falha: 4
-Iniciando eleição
-Novo master: (...)
-Este nó virou master
 ```
+[2026-05-11 19:30:11] MASTER ATIVO EM 127.0.0.1:2003 (Master_A)
+[2026-05-11 19:30:30] Conexao de ('127.0.0.1', 64776) mensagem={'WORKER': 'ALIVE', 'WORKER_UUID': 'W-123', 'CONTROL_ADDRESS': '127.0.0.1:2103'}
+[2026-05-11 19:30:31] Status recebido: worker=W-123 origem=local status=OK
+[2026-05-11 19:30:34] Saturacao detectada: load=14 capacity=10
+```
+
+- Trechos do log observado (Worker):
+
+```
+[WORKER W-123] Registrando no master (legacy): ('127.0.0.1', 2003)
+[WORKER W-123] Canal de controle ouvindo em 127.0.0.1:2103
+[WORKER W-123] Task para USER=Ana concluida com OK. ACK={'STATUS': 'ACK', 'WORKER_UUID': 'W-123'}
+```
+
+Observações: o Master enfileirou tarefas (seed) para simular carga e o Worker recebeu e processou `QUERY` geradas, reportando `STATUS` e recebendo `ACK` do Master. A negociação com `Master_B` expirou por timeout no teste local (esperado, pois não havia vizinho acessível).
