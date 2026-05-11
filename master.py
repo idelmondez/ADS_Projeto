@@ -104,6 +104,20 @@ def handle_worker_alive_message(mensagem, addr):
     return get_next_task_for_worker(worker_id)
 
 
+def list_worker_addresses():
+    with registry_lock:
+        out = []
+        for w in worker_registry.values():
+            addr = w.get("control_address")
+            if addr:
+                out.append(addr)
+            else:
+                a = w.get("addr")
+                if a:
+                    out.append(f"{a}:{PORT}")
+        return out
+
+
 def handle_worker_status_message(mensagem):
     ok, err = require_fields(mensagem, ["STATUS", "TASK", "WORKER_UUID"])
     if not ok:
@@ -246,6 +260,7 @@ def handle_legacy_message(mensagem):
             "SERVER_UUID": SERVER_UUID,
             "TASK": "HEARTBEAT",
             "RESPONSE": "ALIVE",
+            "workers": list_worker_addresses(),
         }
 
     if task == "REGISTER":
@@ -253,7 +268,7 @@ def handle_legacy_message(mensagem):
         if worker_ip:
             workers_ativos.add(worker_ip)
             log(f"Workers ativos (legacy): {workers_ativos}")
-        return {"STATUS": "REGISTERED"}
+        return {"STATUS": "REGISTERED", "workers": list_worker_addresses()}
 
     if task == "DISK":
         return {"FREE": get_espaco_livre()}
@@ -353,20 +368,34 @@ def seed_task_loop():
         time.sleep(1.5)
 
 
-def iniciar_master(host, port=2003):
+def iniciar_master(host, port=2003, stop_event=None):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((host, port))
     server.listen(10)
+    server.settimeout(1.0)
 
     log(f"MASTER ATIVO EM {host}:{port} ({SERVER_UUID})")
 
     threading.Thread(target=monitor_saturation_loop, daemon=True).start()
     threading.Thread(target=seed_task_loop, daemon=True).start()
 
-    while True:
-        conn, addr = server.accept()
-        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+    try:
+        while True:
+            if stop_event and stop_event.is_set():
+                log("Stop event set, encerrando servidor master")
+                break
+
+            try:
+                conn, addr = server.accept()
+                threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+            except socket.timeout:
+                continue
+    finally:
+        try:
+            server.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

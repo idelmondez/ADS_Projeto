@@ -13,9 +13,10 @@ PORT = 2003
 WORKER_UUID = "W-123"
 CONTROL_PORT = 2103
 
-WORKERS = [
-    ("192.168.1.47", 2003),
-]
+WORKERS = []
+
+# known_workers is populated dynamically from master responses (addresses like "ip:port")
+known_workers = []
 
 MASTER = ("10.62.134.143", 2003)
 MASTER_UUID = "Master_A"
@@ -58,7 +59,25 @@ def send_and_receive_json(server, payload, timeout=5):
         if not line:
             return None
 
-        return json.loads(line)
+        resp = json.loads(line)
+        # Atualiza known_workers se o master retornar a lista de workers
+        try:
+            wk = resp.get("workers")
+            if wk:
+                with state_lock:
+                    # parse "ip:port" strings
+                    known_workers.clear()
+                    for a in wk:
+                        if isinstance(a, str) and ":" in a:
+                            host, port = a.rsplit(":", 1)
+                            try:
+                                known_workers.append((host, int(port)))
+                            except Exception:
+                                continue
+        except Exception:
+            pass
+
+        return resp
 
 
 def registrar_legacy():
@@ -243,7 +262,11 @@ def eleicao():
     log("Iniciando eleicao")
     candidatos = []
 
-    for worker in WORKERS:
+    # Consultar workers conhecidos para obter espaço em disco
+    with state_lock:
+        peers = list(known_workers)
+
+    for worker in peers:
         try:
             payload = {"TASK": "DISK"}
             resposta = send_and_receive_json(worker, payload, timeout=2)
@@ -253,9 +276,25 @@ def eleicao():
             continue
 
     candidatos.append((MEU_IP, get_espaco_livre()))
+
     novo_master_ip = max(candidatos, key=lambda x: (x[1], x[0]))[0]
     MASTER = (novo_master_ip, PORT)
     log(f"Novo master eleito: {MASTER}")
+
+    # Se este no foi eleito master, iniciar servidor local; caso contrario, se
+    # havia um master local rodando, encerra-lo para virar worker.
+    global local_master_thread, local_master_stop_event
+    if novo_master_ip == MEU_IP:
+        iniciar_master_local()
+    else:
+        if local_master_thread and local_master_thread.is_alive():
+            log("Nodo deixou de ser master local -> encerrando servidor local")
+            try:
+                local_master_stop_event.set()
+            except Exception:
+                pass
+            local_master_thread = None
+            local_master_stop_event = None
 
     if novo_master_ip == MEU_IP:
         anunciar()
@@ -273,8 +312,18 @@ def anunciar():
 
 
 def iniciar_master_local():
+    global local_master_thread, local_master_stop_event
     log("Este no virou master")
-    master.iniciar_master(MEU_IP, PORT)
+    if local_master_thread and local_master_thread.is_alive():
+        log("Master local ja em execucao")
+        return
+
+    stop_event = threading.Event()
+    t = threading.Thread(target=master.iniciar_master, args=(MEU_IP, PORT, stop_event), daemon=True)
+    t.start()
+    local_master_thread = t
+    local_master_stop_event = stop_event
+    log("Master local iniciado em thread")
 
 
 def main_loop():
