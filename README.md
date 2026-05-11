@@ -76,6 +76,65 @@ python worker.py
 - Fluxo legado de eleicao/failover (`DISK`, `NEW_MASTER`) foi mantido.
 - Mensagens com `type` desconhecido sao logadas e ignoradas sem derrubar processo.
 
+## Implantação em múltiplas máquinas
+
+Instruções para rodar o sistema em uma rede com vários computadores (cada um com seu IP). Siga estes passos em cada máquina antes de iniciar os processos.
+
+- 1) Escolha os papéis iniciais
+    - Em cada máquina que será potencial `Master`, edite [master.py](master.py) definindo `SERVER_UUID` e `HOST` para o IP dessa máquina. Exemplo:
+
+```python
+# master.py (exemplo)
+SERVER_UUID = "Master_A"        # identifique unicamente cada master
+HOST = "10.62.134.143"         # IP desta máquina
+PORT = 2003                      # mesma porta em toda a rede
+```
+
+    - Em cada máquina que será `Worker`, edite [worker.py](worker.py) definindo `MEU_IP` e `WORKER_UUID` e apontando `MASTER` para o master inicial conhecido (ip,port):
+
+```python
+# worker.py (exemplo)
+MEU_IP = "10.62.134.144"        # IP desta máquina (worker)
+WORKER_UUID = "W-001"           # identifique unicamente cada worker
+MASTER = ("10.62.134.143", 2003) # ip:porta do master inicial
+CONTROL_PORT = 2103              # porta usada para comandos redirect/release
+```
+
+- 2) Não liste IPs individuais de Workers em arquivos de configuração
+    - Não é necessário nem recomendado codificar os IPs de cada worker no código. O `master` descobrirá os workers que se conectarem (e retornará a lista via `HEARTBEAT`/`REGISTER`). Os workers atualizarão `known_workers` dinamicamente a partir da resposta do `master`.
+
+- 3) Redes e portas
+    - Use a mesma `PORT` para todos os masters e abra essa porta no firewall.
+    - Abra também a `CONTROL_PORT` nas máquinas que rodarem workers para aceitar `command_redirect` e `command_release`.
+
+- 4) Neighbors (masters vizinhos)
+    - Em [master.py](master.py) o campo `NEIGHBORS` deve conter outros *masters* conhecidos (master_id, ip, port). Exemplo:
+
+```python
+NEIGHBORS = [ ("Master_B", "10.62.134.144", 2003), ... ]
+```
+
+    - Esses endpoints são usados para negociar (`request_help`). Se sua topologia for dinâmica, mantenha uma forma de atualizá-los (DNS, arquivo de configuração central, ou serviço de descoberta).
+
+- 5) Ordem de inicialização
+    - Inicialmente: escolha um master e inicie `master.py` nessa máquina (ou inicie `worker.py` em modo que possa se tornar master automaticamente). Depois inicie `worker.py` nas demais máquinas.
+    - Nota: o código atual suporta iniciar `master` em thread a partir do `worker` — um worker eleito passa a rodar um `master` local automaticamente.
+
+- 6) Verificações e manutenção
+    - Verifique conectividade TCP entre máquinas (`telnet ip port` / `nc -vz ip port`).
+    - Garanta que cada `SERVER_UUID` e `WORKER_UUID` sejam únicos na rede.
+    - Se um master cair, os workers executarão eleição e um worker pode virar master; o master anterior poderá retornar como worker ao reestabelecer-se.
+
+- 7) Executar
+    - Em cada máquina (após ajustes):
+
+```bash
+python master.py   # se for iniciar master manualmente
+python worker.py   # iniciar worker (pode também iniciar master local quando eleito)
+```
+
+Se desejar, mantenha um arquivo central com a lista de `NEIGHBORS` para facilitar administração e atualize o `README.md` ou scripts de implantação para refletir o workflow de sua infraestrutura.
+
 ## Teste rápido (local)
 
 O teste abaixo foi executado localmente usando `127.0.0.1` como endpoint.
