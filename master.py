@@ -1,5 +1,6 @@
 import json
 import queue
+import os
 import shutil
 import socket
 import threading
@@ -10,6 +11,16 @@ from datetime import datetime
 SERVER_UUID = "Master_A"
 HOST = "10.62.134.143"
 PORT = 2003
+
+env_host = os.getenv("MASTER_HOST")
+env_port = os.getenv("MASTER_PORT")
+if env_host:
+    HOST = env_host
+if env_port:
+    try:
+        PORT = int(env_port)
+    except Exception:
+        pass
 
 # Sprint 03: limiares de saturacao/histerese.
 CAPACITY = 10

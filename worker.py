@@ -31,6 +31,28 @@ local_master_thread = None
 local_master_stop_event = None
 state_lock = threading.Lock()
 
+# Environment overrides (useful for tests that spawn multiple worker processes)
+import os
+env_meu = os.getenv("MEU_IP")
+if env_meu:
+    MEU_IP = env_meu
+env_worker = os.getenv("WORKER_UUID")
+if env_worker:
+    WORKER_UUID = env_worker
+env_control = os.getenv("CONTROL_PORT")
+if env_control:
+    try:
+        CONTROL_PORT = int(env_control)
+    except Exception:
+        pass
+env_master_host = os.getenv("MASTER_HOST")
+env_master_port = os.getenv("MASTER_PORT")
+if env_master_host and env_master_port:
+    try:
+        MASTER = (env_master_host, int(env_master_port))
+    except Exception:
+        pass
+
 
 def log(msg):
     print(f"[WORKER {WORKER_UUID}] {msg}")
@@ -39,6 +61,10 @@ def log(msg):
 def get_espaco_livre():
     total, usado, livre = shutil.disk_usage("/")
     return livre
+
+
+def get_espaco_livre_mb():
+    return get_espaco_livre() // (1024 * 1024)
 
 def send_and_receive_json(server, payload, timeout=5):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -273,7 +299,11 @@ def controle_listener():
             mensagem = json.loads(line)
             # handler: support legacy DISK query and type-based control messages
             if mensagem.get("TASK") == "DISK":
-                resposta = {"FREE": get_espaco_livre()}
+                resposta = {
+                    "FREE": get_espaco_livre(),
+                    "WORKER_UUID": WORKER_UUID,
+                    "CONTROL_PORT": CONTROL_PORT,
+                }
             else:
                 resposta = tratar_comando_controle(mensagem)
             conn.sendall((json.dumps(resposta) + "\n").encode())
@@ -299,13 +329,19 @@ def eleicao():
             payload = {"TASK": "DISK"}
             resposta = send_and_receive_json(worker, payload, timeout=2)
             if resposta and "FREE" in resposta:
-                candidatos.append((worker[0], resposta["FREE"]))
+                candidatos.append(
+                    (
+                        worker[0],
+                        worker[1],
+                        resposta["FREE"] // (1024 * 1024),
+                    )
+                )
         except Exception:
             continue
 
-    candidatos.append((MEU_IP, get_espaco_livre()))
+    candidatos.append((MEU_IP, CONTROL_PORT, get_espaco_livre_mb()))
 
-    novo_master_ip = max(candidatos, key=lambda x: (x[1], x[0]))[0]
+    novo_master_ip, novo_master_port, _ = max(candidatos, key=lambda x: x[2])
     MASTER = (novo_master_ip, PORT)
     log(f"Novo master eleito: {MASTER}")
 
