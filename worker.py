@@ -1,10 +1,10 @@
 import json
+import os
 import random
 import shutil
 import socket
 import threading
 import time
-import uuid
 
 import master
 
@@ -12,81 +12,22 @@ MEU_IP = None
 PORT = 2003
 WORKER_UUID = "W-123"
 CONTROL_PORT = 2103
-
-WORKERS = []
-
-# known_workers is populated dynamically from master responses (addresses like "ip:port")
-known_workers = []
-
 MASTER = None
 MASTER_UUID = "Master_A"
+WORKERS = []
+known_workers = []
 
 falhas = 0
 eleicao_em_andamento = False
-
-# Quando estiver emprestado, guarda o master de origem para preencher SERVER_UUID.
 ORIGINAL_MASTER_ADDRESS = None
-
 local_master_thread = None
 local_master_stop_event = None
 state_lock = threading.Lock()
 
-# Environment overrides (useful for tests that spawn multiple worker processes)
-import os
-env_meu = os.getenv("MEU_IP")
-import master
 
-MEU_IP = None
-PORT = 2003
-WORKER_UUID = "W-123"
-CONTROL_PORT = 2103
-
-WORKERS = []
-
-# known_workers is populated dynamically from master responses (addresses like "ip:port")
-known_workers = []
-
-MASTER = None
-MASTER_UUID = "Master_A"
-
-falhas = 0
-eleicao_em_andamento = False
-
-# Quando estiver emprestado, guarda o master de origem para preencher SERVER_UUID.
-ORIGINAL_MASTER_ADDRESS = None
-
-local_master_thread = None
-local_master_stop_event = None
-state_lock = threading.Lock()
-
-# Environment overrides (useful for tests that spawn multiple worker processes)
-import os
-env_meu = os.getenv("MEU_IP")
-if env_meu:
-    MEU_IP = env_meu
-env_worker = os.getenv("WORKER_UUID")
-if env_worker:
-    WORKER_UUID = env_worker
-env_control = os.getenv("CONTROL_PORT")
-if env_control:
-    try:
-        CONTROL_PORT = int(env_control)
-    except Exception:
-        pass
-env_master_host = os.getenv("MASTER_HOST")
-env_master_port = os.getenv("MASTER_PORT")
-if env_master_host and env_master_port:
-    try:
-        MASTER = (env_master_host, int(env_master_port))
-    except Exception:
-        pass
-
-
-# Auto-detect local IP when not provided via environment
 def detect_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # doesn't need to be reachable; used to select the outbound interface
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
@@ -95,14 +36,74 @@ def detect_local_ip():
         return "127.0.0.1"
 
 
+env_meu = os.getenv("MEU_IP")
+if env_meu:
+    MEU_IP = env_meu
+
+env_worker = os.getenv("WORKER_UUID")
+if env_worker:
+    WORKER_UUID = env_worker
+
+env_control = os.getenv("CONTROL_PORT")
+if env_control:
+    try:
+        CONTROL_PORT = int(env_control)
+    except Exception:
+        pass
+
+env_master_host = os.getenv("MASTER_HOST")
+env_master_port = os.getenv("MASTER_PORT")
+if env_master_host and env_master_port:
+    try:
+        MASTER = (env_master_host, int(env_master_port))
+    except Exception:
+        pass
+
 if not MEU_IP:
     MEU_IP = detect_local_ip()
 
-# If MASTER wasn't configured by env, assume local master at the standard PORT
 if MASTER is None:
     MASTER = (MEU_IP, PORT)
+
+
+def log(msg):
+    print(f"[WORKER {WORKER_UUID}] {msg}")
+
+
+def get_espaco_livre():
+    total, usado, livre = shutil.disk_usage("/")
+    return livre
+
+
+def get_espaco_livre_mb():
+    return get_espaco_livre() // (1024 * 1024)
+
+
+def send_and_receive_json(server, payload, timeout=5):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(server)
+        s.sendall((json.dumps(payload) + "\n").encode())
+
+        data = b""
+        while b"\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+
+        if not data:
+            return None
+
+        line = data.split(b"\n", 1)[0].decode().strip()
+        if not line:
+            return None
+
+        resp = json.loads(line)
+        try:
+            wk = resp.get("workers")
+            if wk:
                 with state_lock:
-                    # parse "ip:port" strings
                     known_workers.clear()
                     for a in wk:
                         if isinstance(a, str) and ":" in a:
@@ -118,7 +119,6 @@ if MASTER is None:
 
 
 def registrar_legacy():
-    global MASTER
     try:
         log(f"Registrando no master (legacy): {MASTER}")
         payload = {"TASK": "REGISTER", "WORKER": MEU_IP}
@@ -158,7 +158,8 @@ def heartbeat():
 
 
 def solicitar_tarefa_e_processar():
-    global MASTER, ORIGINAL_MASTER_ADDRESS
+    global ORIGINAL_MASTER_ADDRESS
+
     with state_lock:
         current_master = MASTER
         borrowed_from = ORIGINAL_MASTER_ADDRESS
@@ -168,7 +169,6 @@ def solicitar_tarefa_e_processar():
         "WORKER_UUID": WORKER_UUID,
         "CONTROL_ADDRESS": f"{MEU_IP}:{CONTROL_PORT}",
     }
-
     if borrowed_from:
         payload["SERVER_UUID"] = borrowed_from
 
@@ -192,12 +192,10 @@ def solicitar_tarefa_e_processar():
                 "TASK": "QUERY",
                 "WORKER_UUID": WORKER_UUID,
             }
-
             ack = send_and_receive_json(current_master, report, timeout=5)
             log(f"Task para USER={user} concluida com {status}. ACK={ack}")
             return
 
-        # Compatibilidade futura: ignora payloads desconhecidos sem derrubar o loop.
         log(f"Mensagem de tarefa desconhecida ignorada: {resposta}")
 
     except Exception as e:
@@ -205,7 +203,7 @@ def solicitar_tarefa_e_processar():
 
 
 def tratar_comando_controle(mensagem):
-    global MASTER, ORIGINAL_MASTER_ADDRESS
+    global MASTER, ORIGINAL_MASTER_ADDRESS, local_master_thread, local_master_stop_event
 
     msg_type = mensagem.get("type")
     request_id = mensagem.get("request_id")
@@ -225,7 +223,6 @@ def tratar_comando_controle(mensagem):
             with state_lock:
                 ORIGINAL_MASTER_ADDRESS = f"{MASTER[0]}:{MASTER[1]}"
                 MASTER = (host, int(port_str))
-
             log(f"Redirecionado para novo master={MASTER} origem={ORIGINAL_MASTER_ADDRESS}")
             return {
                 "type": "redirect_ack",
@@ -254,7 +251,6 @@ def tratar_comando_controle(mensagem):
             with state_lock:
                 MASTER = (host, int(port_str))
                 ORIGINAL_MASTER_ADDRESS = None
-
             log(f"Liberado para retornar ao master original={MASTER}")
             return {
                 "type": "release_ack",
@@ -277,8 +273,6 @@ def tratar_comando_controle(mensagem):
                 with state_lock:
                     MASTER = (host, int(port_str))
                 log(f"Announce recebido: novo master={MASTER}")
-                # se havia um master local, encerre-o
-                global local_master_thread, local_master_stop_event
                 if local_master_thread and local_master_thread.is_alive():
                     try:
                         local_master_stop_event.set()
@@ -312,6 +306,27 @@ def controle_listener():
     while True:
         conn, addr = server.accept()
         try:
+            data = b""
+            while b"\n" not in data:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+
+            if not data:
+                continue
+
+            line = data.split(b"\n", 1)[0].decode().strip()
+            if not line:
+                continue
+
+            mensagem = json.loads(line)
+            if mensagem.get("TASK") == "DISK":
+                resposta = {
+                    "FREE": get_espaco_livre(),
+                    "WORKER_UUID": WORKER_UUID,
+                    "CONTROL_PORT": CONTROL_PORT,
+                }
             else:
                 resposta = tratar_comando_controle(mensagem)
 
@@ -320,10 +335,7 @@ def controle_listener():
         except json.JSONDecodeError as e:
             log(f"Erro ao fazer parse JSON no listener de controle: {e}")
             try:
-                erro_resp = {
-                    "type": "error",
-                    "payload": {"reason": "json_decode_error"}
-                }
+                erro_resp = {"type": "error", "payload": {"reason": "json_decode_error"}}
                 conn.sendall((json.dumps(erro_resp) + "\n").encode())
             except Exception:
                 pass
@@ -334,36 +346,14 @@ def controle_listener():
                 conn.close()
             except Exception:
                 pass
-            
-            conn.sendall((json.dumps(resposta) + "\n").encode())
-
-        except json.JSONDecodeError as e:
-            log(f"Erro ao fazer parse JSON no listener de controle: {e}")
-            try:
-                erro_resp = {
-                    "type": "error",
-                    "payload": {"reason": "json_decode_error"}
-                }
-                conn.sendall((json.dumps(erro_resp) + "\n").encode())
-            except Exception:
-                pass
-        except Exception as e:
-            log(f"Erro no listener de controle: {e}")
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
->>>>>>> d8aa60d (Detectar IP local automaticamente; update worker.py, master.py, test_multi_workers.py)
 
 
 def eleicao():
-    global MASTER
+    global MASTER, local_master_thread, local_master_stop_event
 
     log("Iniciando eleicao")
     candidatos = []
 
-    # Consultar workers conhecidos para obter espaço em disco
     with state_lock:
         peers = list(known_workers)
 
@@ -372,13 +362,7 @@ def eleicao():
             payload = {"TASK": "DISK"}
             resposta = send_and_receive_json(worker, payload, timeout=2)
             if resposta and "FREE" in resposta:
-                candidatos.append(
-                    (
-                        worker[0],
-                        worker[1],
-                        resposta["FREE"] // (1024 * 1024),
-                    )
-                )
+                candidatos.append((worker[0], worker[1], resposta["FREE"] // (1024 * 1024)))
         except Exception:
             continue
 
@@ -388,10 +372,8 @@ def eleicao():
     MASTER = (novo_master_ip, PORT)
     log(f"Novo master eleito: {MASTER}")
 
-    # Se este no foi eleito master, iniciar servidor local; caso contrario, se
-    # havia um master local rodando, encerra-lo para virar worker.
-    global local_master_thread, local_master_stop_event
     if novo_master_ip == MEU_IP:
+        anunciar()
         iniciar_master_local()
     else:
         if local_master_thread and local_master_thread.is_alive():
@@ -402,10 +384,6 @@ def eleicao():
                 pass
             local_master_thread = None
             local_master_stop_event = None
-
-    if novo_master_ip == MEU_IP:
-        anunciar()
-        iniciar_master_local()
 
 
 def anunciar():
