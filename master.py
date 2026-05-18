@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 
 SERVER_UUID = "Master_A"
-HOST = "10.62.134.143"
+HOST = None
 PORT = 2003
 
 env_host = os.getenv("MASTER_HOST")
@@ -21,6 +21,21 @@ if env_port:
         PORT = int(env_port)
     except Exception:
         pass
+
+# Auto-detect local IP when MASTER_HOST is not provided
+def detect_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+if not HOST:
+    HOST = detect_local_ip()
 
 # Sprint 03: limiares de saturacao/histerese.
 CAPACITY = 10
@@ -37,6 +52,8 @@ MASTER_ATUAL = None
 task_queue = queue.Queue()
 worker_registry = {}
 registry_lock = threading.Lock()
+borrowed_workers = {}  # Rastreia workers emprestados: worker_id -> original_master_address
+borrowed_workers_lock = threading.Lock()
 
 
 def log(msg):
@@ -161,6 +178,17 @@ def handle_type_message(mensagem):
     request_id = mensagem.get("request_id")
     payload = mensagem.get("payload", {})
 
+    if msg_type == "announce_master":
+        # Handler para anúncio de novo master (comunicação entre masters)
+        master_addr = payload.get("master_address")
+        if master_addr:
+            log(f"Anúncio de novo master recebido: {master_addr}")
+        return {
+            "type": "announce_ack",
+            "request_id": request_id,
+            "payload": {"status": "ACK"},
+        }
+
     if msg_type == "request_help":
         ok, err = require_fields(payload, ["master_id", "current_load", "capacity", "workers_needed"])
         if not ok:
@@ -204,7 +232,8 @@ def handle_type_message(mensagem):
                 }
             )
 
-        return {
+        # Armazenar informações sobre os workers sendo ofertados para posterior envio de command_redirect
+        response_msg = {
             "type": "response_accepted",
             "request_id": request_id,
             "payload": {
@@ -212,6 +241,22 @@ def handle_type_message(mensagem):
                 "worker_details": details,
             },
         }
+
+        # Agendar envio de command_redirect em thread separada
+        def send_redirects():
+            requester_id = payload.get("master_id")
+            requester_load = payload.get("current_load")
+            requester_capacity = payload.get("capacity")
+
+            # Calcular novo endereço do master solicitante (IP:PORT)
+            # Isso será enviado pelo handler que recebeu a requisição
+            log(f"Agendando redirecionamento de {len(offered)} workers para Master {requester_id}")
+            # O sender da requisição será responsável por informar seu endereço
+            # Por enquanto, apenas registramos a intenção
+
+        threading.Thread(target=send_redirects, daemon=True).start()
+
+        return response_msg
 
     if msg_type == "register_temporary_worker":
         ok, err = require_fields(payload, ["worker_id", "original_master_address"])
@@ -223,18 +268,22 @@ def handle_type_message(mensagem):
             }
 
         worker_id = payload["worker_id"]
+        original_master = payload["original_master_address"]
         with registry_lock:
             worker_registry[worker_id] = {
                 "worker_id": worker_id,
                 "borrowed": True,
-                "original_master": payload["original_master_address"],
+                "original_master": original_master,
                 "busy": False,
                 "last_seen": time.time(),
                 "addr": None,
                 "control_address": None,
             }
 
-        log(f"Worker temporario registrado: {worker_id} de {payload['original_master_address']}")
+        with borrowed_workers_lock:
+            borrowed_workers[worker_id] = original_master
+
+        log(f"Worker temporario registrado: {worker_id} de {original_master}. Total emprestados: {len(borrowed_workers)}")
         return {
             "type": "register_ack",
             "request_id": request_id,
@@ -246,7 +295,9 @@ def handle_type_message(mensagem):
         if worker_id:
             with registry_lock:
                 worker_registry.pop(worker_id, None)
-            log(f"Worker devolvido removido da lista local: {worker_id}")
+            with borrowed_workers_lock:
+                borrowed_workers.pop(worker_id, None)
+            log(f"Worker devolvido removido da lista local: {worker_id}. Total emprestados: {len(borrowed_workers)}")
         return {
             "type": "notify_ack",
             "request_id": request_id,
@@ -310,103 +361,55 @@ def handle_client(conn, addr):
         log(f"Conexao de {addr} mensagem={mensagem}")
 
         if "type" in mensagem:
-            resposta = handle_type_message(mensagem)
-        elif mensagem.get("WORKER") == "ALIVE":
-            resposta = handle_worker_alive_message(mensagem, addr)
-        elif "STATUS" in mensagem and "WORKER_UUID" in mensagem:
-            resposta = handle_worker_status_message(mensagem)
-        else:
-            resposta = handle_legacy_message(mensagem)
+            resp = handle_type_message(mensagem)
+            send_json_line(conn, resp)
+            return
 
-        send_json_line(conn, resposta)
+        # legacy handling
+        resp = handle_legacy_message(mensagem)
+        send_json_line(conn, resp)
 
-    except json.JSONDecodeError:
-        log("Erro: JSON invalido recebido")
     except Exception as e:
-        log(f"Erro: {e}")
-    finally:
-        conn.close()
-
-
-def request_help_from_neighbor(neighbor):
-    neighbor_id, ip, port = neighbor
-    request_id = str(uuid.uuid4())
-    payload = {
-        "type": "request_help",
-        "request_id": request_id,
-        "payload": {
-            "master_id": SERVER_UUID,
-            "current_load": task_queue.qsize(),
-            "capacity": CAPACITY,
-            "workers_needed": max(1, task_queue.qsize() - CAPACITY),
-        },
-    }
-
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(5)
-            s.connect((ip, port))
-            send_json_line(s, payload)
-            response = recv_json_line(s)
-            log(
-                f"Negociacao com {neighbor_id}: request_id={request_id} "
-                f"response={response}"
-            )
-            return response
-    except Exception as e:
-        log(f"Falha ao negociar com {neighbor_id} ({ip}:{port}): {e}")
-        return None
-
-
-def monitor_saturation_loop():
-    while True:
-        current_load = task_queue.qsize()
-        if current_load > CAPACITY:
-            log(f"Saturacao detectada: load={current_load} capacity={CAPACITY}")
-            # Sistema configurado para ter um unico master por vez. Neste modo
-            # nao tentamos negociar com outros masters; a escala horizontal via
-            # emprestimo de workers nao e suportada quando so existe um master.
-        time.sleep(2)
-
-
-def seed_task_loop():
-    users = ["Ana", "Bruno", "Carlos", "Daniela", "Eva", "Fabio", "Giulia", "Henrique"]
-    idx = 0
-    while True:
-        task_queue.put(users[idx % len(users)])
-        idx += 1
-        time.sleep(1.5)
-
-
-def iniciar_master(host, port=2003, stop_event=None):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((host, port))
-    server.listen(10)
-    server.settimeout(1.0)
-
-    log(f"MASTER ATIVO EM {host}:{port} ({SERVER_UUID})")
-
-    threading.Thread(target=monitor_saturation_loop, daemon=True).start()
-    threading.Thread(target=seed_task_loop, daemon=True).start()
-
-    try:
-        while True:
-            if stop_event and stop_event.is_set():
-                log("Stop event set, encerrando servidor master")
-                break
-
-            try:
-                conn, addr = server.accept()
-                threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
-            except socket.timeout:
-                continue
+        log(f"Erro no handle_client: {e}")
     finally:
         try:
-            server.close()
+            conn.close()
         except Exception:
             pass
 
 
+def monitor_borrowed_workers_loop():
+    while True:
+        with borrowed_workers_lock:
+            for wid, orig in list(borrowed_workers.items()):
+                # Optionally implement health checks
+                pass
+        time.sleep(5)
+
+
+def iniciar_master(host, port, stop_event):
+    log(f"Master iniciando em {host}:{port}")
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((host, port))
+    server.listen(5)
+
+    threading.Thread(target=monitor_borrowed_workers_loop, daemon=True).start()
+
+    while not stop_event.is_set():
+        try:
+            conn, addr = server.accept()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+        except Exception as e:
+            log(f"Erro no master accept: {e}")
+            time.sleep(0.1)
+
+    try:
+        server.close()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    iniciar_master(HOST, PORT)
+    stop_event = threading.Event()
+    iniciar_master(HOST, PORT, stop_event)

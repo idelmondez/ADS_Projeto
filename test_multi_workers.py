@@ -3,9 +3,23 @@ import os
 import subprocess
 import threading
 import time
+import socket
 
 PY = 'c:/python313/python.exe'
-MASTER_HOST = '127.0.0.1'
+
+
+def detect_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return '127.0.0.1'
+
+
+MASTER_HOST = detect_local_ip()
 MASTER_PORT = '2003'
 
 procs = []
@@ -38,7 +52,7 @@ time.sleep(2)
 for i in range(3):
     env = os.environ.copy()
     env['PYTHONUNBUFFERED'] = '1'
-    env['MEU_IP'] = f'127.0.0.1'
+    env['MEU_IP'] = f'{MASTER_HOST}'
     env['WORKER_UUID'] = f'W-{i+1}'
     env['CONTROL_PORT'] = str(2103 + i)
     env['MASTER_HOST'] = MASTER_HOST

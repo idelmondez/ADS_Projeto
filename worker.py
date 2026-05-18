@@ -8,7 +8,7 @@ import uuid
 
 import master
 
-MEU_IP = "10.62.134.143"
+MEU_IP = None
 PORT = 2003
 WORKER_UUID = "W-123"
 CONTROL_PORT = 2103
@@ -18,7 +18,35 @@ WORKERS = []
 # known_workers is populated dynamically from master responses (addresses like "ip:port")
 known_workers = []
 
-MASTER = ("10.62.134.143", 2003)
+MASTER = None
+MASTER_UUID = "Master_A"
+
+falhas = 0
+eleicao_em_andamento = False
+
+# Quando estiver emprestado, guarda o master de origem para preencher SERVER_UUID.
+ORIGINAL_MASTER_ADDRESS = None
+
+local_master_thread = None
+local_master_stop_event = None
+state_lock = threading.Lock()
+
+# Environment overrides (useful for tests that spawn multiple worker processes)
+import os
+env_meu = os.getenv("MEU_IP")
+import master
+
+MEU_IP = None
+PORT = 2003
+WORKER_UUID = "W-123"
+CONTROL_PORT = 2103
+
+WORKERS = []
+
+# known_workers is populated dynamically from master responses (addresses like "ip:port")
+known_workers = []
+
+MASTER = None
 MASTER_UUID = "Master_A"
 
 falhas = 0
@@ -54,43 +82,25 @@ if env_master_host and env_master_port:
         pass
 
 
-def log(msg):
-    print(f"[WORKER {WORKER_UUID}] {msg}")
+# Auto-detect local IP when not provided via environment
+def detect_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # doesn't need to be reachable; used to select the outbound interface
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 
-def get_espaco_livre():
-    total, usado, livre = shutil.disk_usage("/")
-    return livre
+if not MEU_IP:
+    MEU_IP = detect_local_ip()
 
-
-def get_espaco_livre_mb():
-    return get_espaco_livre() // (1024 * 1024)
-
-def send_and_receive_json(server, payload, timeout=5):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(timeout)
-        s.connect(server)
-        s.sendall((json.dumps(payload) + "\n").encode())
-
-        data = b""
-        while b"\n" not in data:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-
-        if not data:
-            return None
-
-        line = data.split(b"\n", 1)[0].decode().strip()
-        if not line:
-            return None
-
-        resp = json.loads(line)
-        # Atualiza known_workers se o master retornar a lista de workers
-        try:
-            wk = resp.get("workers")
-            if wk:
+# If MASTER wasn't configured by env, assume local master at the standard PORT
+if MASTER is None:
+    MASTER = (MEU_IP, PORT)
                 with state_lock:
                     # parse "ip:port" strings
                     known_workers.clear()
@@ -148,6 +158,7 @@ def heartbeat():
 
 
 def solicitar_tarefa_e_processar():
+    global MASTER, ORIGINAL_MASTER_ADDRESS
     with state_lock:
         current_master = MASTER
         borrowed_from = ORIGINAL_MASTER_ADDRESS
@@ -209,17 +220,25 @@ def tratar_comando_controle(mensagem):
                 "payload": {"reason": "invalid_new_master_address"},
             }
 
-        host, port_str = new_master_address.rsplit(":", 1)
-        with state_lock:
-            ORIGINAL_MASTER_ADDRESS = f"{MASTER[0]}:{MASTER[1]}"
-            MASTER = (host, int(port_str))
+        try:
+            host, port_str = new_master_address.rsplit(":", 1)
+            with state_lock:
+                ORIGINAL_MASTER_ADDRESS = f"{MASTER[0]}:{MASTER[1]}"
+                MASTER = (host, int(port_str))
 
-        log(f"Redirecionado para novo master={MASTER} origem={ORIGINAL_MASTER_ADDRESS}")
-        return {
-            "type": "redirect_ack",
-            "request_id": request_id,
-            "payload": {"status": "ACK"},
-        }
+            log(f"Redirecionado para novo master={MASTER} origem={ORIGINAL_MASTER_ADDRESS}")
+            return {
+                "type": "redirect_ack",
+                "request_id": request_id,
+                "payload": {"status": "ACK"},
+            }
+        except Exception as e:
+            log(f"Erro ao processar command_redirect: {e}")
+            return {
+                "type": "error",
+                "request_id": request_id,
+                "payload": {"reason": f"error_processing_redirect: {str(e)}"},
+            }
 
     if msg_type == "command_release":
         original_master = payload.get("original_master_address")
@@ -230,34 +249,45 @@ def tratar_comando_controle(mensagem):
                 "payload": {"reason": "invalid_original_master_address"},
             }
 
-        host, port_str = original_master.rsplit(":", 1)
-        with state_lock:
-            MASTER = (host, int(port_str))
-            ORIGINAL_MASTER_ADDRESS = None
+        try:
+            host, port_str = original_master.rsplit(":", 1)
+            with state_lock:
+                MASTER = (host, int(port_str))
+                ORIGINAL_MASTER_ADDRESS = None
 
-        log(f"Liberado para retornar ao master original={MASTER}")
-        return {
-            "type": "release_ack",
-            "request_id": request_id,
-            "payload": {"status": "ACK"},
-        }
+            log(f"Liberado para retornar ao master original={MASTER}")
+            return {
+                "type": "release_ack",
+                "request_id": request_id,
+                "payload": {"status": "ACK"},
+            }
+        except Exception as e:
+            log(f"Erro ao processar command_release: {e}")
+            return {
+                "type": "error",
+                "request_id": request_id,
+                "payload": {"reason": f"error_processing_release: {str(e)}"},
+            }
 
     if msg_type == "announce_master":
         master_addr = payload.get("master_address")
         if master_addr and ":" in master_addr:
-            host, port_str = master_addr.rsplit(":", 1)
-            with state_lock:
-                MASTER = (host, int(port_str))
-            log(f"Announce recebido: novo master={MASTER}")
-            # se havia um master local, encerre-o
-            global local_master_thread, local_master_stop_event
-            if local_master_thread and local_master_thread.is_alive():
-                try:
-                    local_master_stop_event.set()
-                except Exception:
-                    pass
-                local_master_thread = None
-                local_master_stop_event = None
+            try:
+                host, port_str = master_addr.rsplit(":", 1)
+                with state_lock:
+                    MASTER = (host, int(port_str))
+                log(f"Announce recebido: novo master={MASTER}")
+                # se havia um master local, encerre-o
+                global local_master_thread, local_master_stop_event
+                if local_master_thread and local_master_thread.is_alive():
+                    try:
+                        local_master_stop_event.set()
+                    except Exception:
+                        pass
+                    local_master_thread = None
+                    local_master_stop_event = None
+            except Exception as e:
+                log(f"Erro ao processar announce_master: {e}")
 
         return {
             "type": "announce_ack",
@@ -280,38 +310,51 @@ def controle_listener():
     log(f"Canal de controle ouvindo em {MEU_IP}:{CONTROL_PORT}")
 
     while True:
-        conn, _ = server.accept()
+        conn, addr = server.accept()
         try:
-            data = b""
-            while b"\n" not in data:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-
-            if not data:
-                continue
-
-            line = data.split(b"\n", 1)[0].decode().strip()
-            if not line:
-                continue
-
-            mensagem = json.loads(line)
-            # handler: support legacy DISK query and type-based control messages
-            if mensagem.get("TASK") == "DISK":
-                resposta = {
-                    "FREE": get_espaco_livre(),
-                    "WORKER_UUID": WORKER_UUID,
-                    "CONTROL_PORT": CONTROL_PORT,
-                }
             else:
                 resposta = tratar_comando_controle(mensagem)
+
             conn.sendall((json.dumps(resposta) + "\n").encode())
 
+        except json.JSONDecodeError as e:
+            log(f"Erro ao fazer parse JSON no listener de controle: {e}")
+            try:
+                erro_resp = {
+                    "type": "error",
+                    "payload": {"reason": "json_decode_error"}
+                }
+                conn.sendall((json.dumps(erro_resp) + "\n").encode())
+            except Exception:
+                pass
         except Exception as e:
             log(f"Erro no listener de controle: {e}")
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
+            
+            conn.sendall((json.dumps(resposta) + "\n").encode())
+
+        except json.JSONDecodeError as e:
+            log(f"Erro ao fazer parse JSON no listener de controle: {e}")
+            try:
+                erro_resp = {
+                    "type": "error",
+                    "payload": {"reason": "json_decode_error"}
+                }
+                conn.sendall((json.dumps(erro_resp) + "\n").encode())
+            except Exception:
+                pass
+        except Exception as e:
+            log(f"Erro no listener de controle: {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+>>>>>>> d8aa60d (Detectar IP local automaticamente; update worker.py, master.py, test_multi_workers.py)
 
 
 def eleicao():
