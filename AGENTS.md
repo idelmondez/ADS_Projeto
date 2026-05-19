@@ -6,7 +6,7 @@ Quick map
 - master.py: master node server and registry
 - worker.py: worker loop, election, and local master bootstrap
 - test_election.py: threaded test (1 master + 1 worker)
-- test_multi_workers.py: multi-process integration test
+- test_multi_workers.py: multi-process integration test'
 
 Docs
 - See README.md for full run/test instructions and environment variables.
