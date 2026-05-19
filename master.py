@@ -11,6 +11,7 @@ from datetime import datetime
 SERVER_UUID = "Master_A"
 HOST = None
 PORT = 2003
+DISCOVERY_PORT = 2103
 
 env_host = os.getenv("MASTER_HOST")
 env_port = os.getenv("MASTER_PORT")
@@ -86,6 +87,48 @@ def recv_json_line(conn):
 
 def send_json_line(conn, payload):
     conn.sendall((json.dumps(payload) + "\n").encode())
+
+
+def udp_discovery_listener(stop_event, host="0.0.0.0", port=DISCOVERY_PORT):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.settimeout(1.0)
+    except Exception as e:
+        log(f"Erro ao iniciar listener UDP de discovery: {e}")
+        return
+
+    while not stop_event.is_set():
+        try:
+            data, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except Exception:
+            continue
+
+        try:
+            payload = json.loads(data.decode().strip())
+        except Exception:
+            continue
+
+        if payload.get("TASK") != "HEARTBEAT":
+            continue
+
+        response = {
+            "SERVER_UUID": SERVER_UUID,
+            "TASK": "HEARTBEAT",
+            "RESPONSE": "ALIVE",
+        }
+        try:
+            sock.sendto((json.dumps(response) + "\n").encode(), addr)
+        except Exception:
+            continue
+
+    try:
+        sock.close()
+    except Exception:
+        pass
 
 
 def require_fields(payload, fields):
@@ -395,6 +438,7 @@ def iniciar_master(host, port, stop_event):
     server.listen(5)
 
     threading.Thread(target=monitor_borrowed_workers_loop, daemon=True).start()
+    threading.Thread(target=udp_discovery_listener, args=(stop_event,), daemon=True).start()
 
     while not stop_event.is_set():
         try:
