@@ -17,12 +17,21 @@ MASTER_UUID = "Master_A"
 WORKERS = []
 known_workers = []
 
+DISCOVERY_PORT = 2103
+DISCOVERY_ATTEMPTS = 3
+DISCOVERY_TIMEOUT = 3
+DISCOVERY_BROADCAST_IP = "255.255.255.255"
+MASTER_FROM_ENV = False
+
 falhas = 0
 eleicao_em_andamento = False
 ORIGINAL_MASTER_ADDRESS = None
 local_master_thread = None
 local_master_stop_event = None
 state_lock = threading.Lock()
+discovery_thread = None
+discovery_result = None
+discovery_lock = threading.Lock()
 
 
 def detect_local_ip():
@@ -56,6 +65,7 @@ env_master_port = os.getenv("MASTER_PORT")
 if env_master_host and env_master_port:
     try:
         MASTER = (env_master_host, int(env_master_port))
+        MASTER_FROM_ENV = True
     except Exception:
         pass
 
@@ -116,6 +126,74 @@ def send_and_receive_json(server, payload, timeout=5):
             pass
 
         return resp
+
+
+def discover_master_via_broadcast(
+    broadcast_ip=DISCOVERY_BROADCAST_IP,
+    port=DISCOVERY_PORT,
+    attempts=DISCOVERY_ATTEMPTS,
+    timeout=DISCOVERY_TIMEOUT,
+    master_port=None,
+):
+    if master_port is None:
+        with state_lock:
+            master_port = MASTER[1]
+
+    payload = {"SERVER_UUID": MASTER_UUID, "TASK": "HEARTBEAT"}
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.settimeout(timeout)
+        for _ in range(attempts):
+            try:
+                s.sendto((json.dumps(payload) + "\n").encode(), (broadcast_ip, port))
+                data, addr = s.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                log(f"Erro no broadcast discovery: {e}")
+                continue
+
+            try:
+                resp = json.loads(data.decode().strip())
+            except Exception:
+                continue
+
+            if resp.get("TASK") == "HEARTBEAT" and resp.get("RESPONSE") == "ALIVE":
+                return (addr[0], master_port)
+
+    return None
+
+
+def _run_discovery():
+    global discovery_result
+    result = discover_master_via_broadcast()
+    if result:
+        with discovery_lock:
+            discovery_result = result
+
+
+def start_discovery_thread():
+    global discovery_thread
+    with discovery_lock:
+        if discovery_thread and discovery_thread.is_alive():
+            return
+        discovery_thread = threading.Thread(target=_run_discovery, daemon=True)
+        discovery_thread.start()
+
+
+def apply_discovery_if_found():
+    global falhas, eleicao_em_andamento, discovery_result, MASTER
+    with discovery_lock:
+        result = discovery_result
+        discovery_result = None
+    if result:
+        with state_lock:
+            MASTER = result
+        falhas = 0
+        eleicao_em_andamento = False
+        log(f"Master descoberto via broadcast: {MASTER}")
+        return True
+    return False
 
 
 def registrar_legacy():
@@ -415,11 +493,19 @@ def main_loop():
     global eleicao_em_andamento
 
     registrar_legacy()
+    if not MASTER_FROM_ENV:
+        start_discovery_thread()
 
     while True:
         ok = heartbeat()
 
+        if not ok:
+            start_discovery_thread()
+
         if not ok and falhas >= 4 and not eleicao_em_andamento:
+            if apply_discovery_if_found():
+                time.sleep(3)
+                continue
             eleicao_em_andamento = True
             eleicao()
 
