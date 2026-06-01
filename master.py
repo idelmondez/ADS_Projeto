@@ -42,9 +42,14 @@ if not HOST:
 CAPACITY = 10
 RELEASE_THRESHOLD = 6
 
+# Porta de comunicacao entre masters.
+MASTER_COMM_PORT = 10000
+MASTER_DISCOVERY_ATTEMPTS = 3
+MASTER_DISCOVERY_TIMEOUT = 3
+
 # Vizinhos para negociacao P2P (master_id, ip, porta).
 NEIGHBORS = [
-    ("Master_B", "192.168.1.48", 2003),
+    ("Master_B", "192.168.1.48", MASTER_COMM_PORT),
 ]
 
 workers_ativos = set()
@@ -55,6 +60,11 @@ worker_registry = {}
 registry_lock = threading.Lock()
 borrowed_workers = {}  # Rastreia workers emprestados: worker_id -> original_master_address
 borrowed_workers_lock = threading.Lock()
+known_master_peers = set()
+master_peers_lock = threading.Lock()
+
+for _, peer_host, peer_port in NEIGHBORS:
+    known_master_peers.add((peer_host, peer_port))
 
 
 def log(msg):
@@ -87,6 +97,138 @@ def recv_json_line(conn):
 
 def send_json_line(conn, payload):
     conn.sendall((json.dumps(payload) + "\n").encode())
+
+
+def send_udp_json(sock, payload, addr):
+    sock.sendto((json.dumps(payload) + "\n").encode(), addr)
+
+
+def register_master_peer(peer_host, peer_port=MASTER_COMM_PORT):
+    if not peer_host:
+        return False
+
+    try:
+        peer_port = int(peer_port)
+    except Exception:
+        peer_port = MASTER_COMM_PORT
+
+    with master_peers_lock:
+        before = len(known_master_peers)
+        known_master_peers.add((peer_host, peer_port))
+        return len(known_master_peers) > before
+
+
+def register_master_peer_from_address(master_address):
+    if not master_address:
+        return False
+
+    if isinstance(master_address, str) and ":" in master_address:
+        host, port_str = master_address.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except Exception:
+            port = MASTER_COMM_PORT
+        return register_master_peer(host, port)
+
+    return register_master_peer(master_address, MASTER_COMM_PORT)
+
+
+def list_master_peers():
+    with master_peers_lock:
+        return sorted(known_master_peers)
+
+
+def discover_master_peers_via_broadcast(
+    broadcast_ip="255.255.255.255",
+    host="0.0.0.0",
+    port=MASTER_COMM_PORT,
+    attempts=MASTER_DISCOVERY_ATTEMPTS,
+    timeout=MASTER_DISCOVERY_TIMEOUT,
+):
+    payload = {
+        "type": "announce_master",
+        "request_id": "broadcast-discovery",
+        "payload": {"master_address": f"{HOST}:{MASTER_COMM_PORT}"},
+    }
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(timeout)
+
+        for _ in range(attempts):
+            try:
+                send_udp_json(sock, payload, (broadcast_ip, port))
+            except Exception as e:
+                log(f"Erro ao enviar broadcast de descoberta de masters: {e}")
+                continue
+
+            while True:
+                try:
+                    data, addr = sock.recvfrom(4096)
+                except socket.timeout:
+                    break
+                except Exception:
+                    break
+
+                try:
+                    resp = json.loads(data.decode().strip())
+                except Exception:
+                    continue
+
+                peer_address = resp.get("peer_address") or resp.get("master_address")
+                if peer_address:
+                    register_master_peer_from_address(peer_address)
+
+                register_master_peer(addr[0], port)
+
+    return list_master_peers()
+
+
+def udp_master_discovery_listener(stop_event, host="0.0.0.0", port=MASTER_COMM_PORT):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.settimeout(1.0)
+    except Exception as e:
+        log(f"Erro ao iniciar listener UDP de descoberta de masters: {e}")
+        return
+
+    while not stop_event.is_set():
+        try:
+            data, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except Exception:
+            continue
+
+        try:
+            mensagem = json.loads(data.decode().strip())
+        except Exception:
+            continue
+
+        if mensagem.get("type") != "announce_master":
+            continue
+
+        payload = mensagem.get("payload", {})
+        if isinstance(payload, dict):
+            register_master_peer_from_address(payload.get("master_address"))
+
+        response = {
+            "type": "announce_master",
+            "request_id": mensagem.get("request_id"),
+            "master_address": f"{HOST}:{MASTER_COMM_PORT}",
+            "peer_address": f"{HOST}:{MASTER_COMM_PORT}",
+        }
+        try:
+            send_udp_json(sock, response, addr)
+        except Exception:
+            continue
+
+    try:
+        sock.close()
+    except Exception:
+        pass
 
 
 def udp_discovery_listener(stop_event, host="0.0.0.0", port=DISCOVERY_PORT):
@@ -127,6 +269,72 @@ def udp_discovery_listener(stop_event, host="0.0.0.0", port=DISCOVERY_PORT):
 
     try:
         sock.close()
+    except Exception:
+        pass
+
+
+def handle_master_comm_client(conn, addr, peer_port=MASTER_COMM_PORT):
+    try:
+        mensagem = recv_json_line(conn)
+        if not mensagem:
+            return
+
+        register_master_peer(addr[0], peer_port)
+        payload = mensagem.get("payload", {})
+        if isinstance(payload, dict):
+            register_master_peer_from_address(payload.get("master_address"))
+
+        log(f"Conexao de master-peer {addr} mensagem={mensagem}")
+
+        if "type" not in mensagem:
+            send_json_line(
+                conn,
+                {
+                    "type": "error",
+                    "request_id": mensagem.get("request_id"),
+                    "payload": {"reason": "missing_type"},
+                },
+            )
+            return
+
+        resp = handle_type_message(mensagem)
+        send_json_line(conn, resp)
+
+    except Exception as e:
+        log(f"Erro no handle_master_comm_client: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def iniciar_master_comm_listener(stop_event, host="0.0.0.0", port=MASTER_COMM_PORT):
+    try:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((host, port))
+        server.listen(5)
+    except Exception as e:
+        log(f"Erro ao iniciar listener de comunicacao entre masters: {e}")
+        return
+
+    log(f"Comunicação entre masters ouvindo em {host}:{port}")
+
+    while not stop_event.is_set():
+        try:
+            conn, addr = server.accept()
+            threading.Thread(
+                target=handle_master_comm_client,
+                args=(conn, addr, port),
+                daemon=True,
+            ).start()
+        except Exception as e:
+            log(f"Erro no master comm accept: {e}")
+            time.sleep(0.1)
+
+    try:
+        server.close()
     except Exception:
         pass
 
@@ -225,6 +433,7 @@ def handle_type_message(mensagem):
         # Handler para anúncio de novo master (comunicação entre masters)
         master_addr = payload.get("master_address")
         if master_addr:
+            register_master_peer_from_address(master_addr)
             log(f"Anúncio de novo master recebido: {master_addr}")
         return {
             "type": "announce_ack",
@@ -438,7 +647,10 @@ def iniciar_master(host, port, stop_event):
     server.listen(5)
 
     threading.Thread(target=monitor_borrowed_workers_loop, daemon=True).start()
+    threading.Thread(target=iniciar_master_comm_listener, args=(stop_event,), daemon=True).start()
+    threading.Thread(target=udp_master_discovery_listener, args=(stop_event,), daemon=True).start()
     threading.Thread(target=udp_discovery_listener, args=(stop_event,), daemon=True).start()
+    threading.Thread(target=discover_master_peers_via_broadcast, daemon=True).start()
 
     while not stop_event.is_set():
         try:
