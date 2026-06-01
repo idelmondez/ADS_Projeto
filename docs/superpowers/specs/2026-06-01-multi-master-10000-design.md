@@ -4,6 +4,8 @@
 
 The repository currently supports a master/worker prototype with heartbeat, election, and master-to-master coordination. The code already accepts `MASTER_HOST` and `MASTER_PORT` to force the master endpoint, and the worker can discover a master via broadcast discovery when no explicit master is configured.
 
+Assume all 15 masters are connected to the same wired LAN, so broadcast discovery can reach every node that should join the coordination mesh.
+
 For this design, assume:
 - There are 15 masters connected in the same coordination network.
 - All masters use port `10000` for master-to-master connectivity.
@@ -19,6 +21,7 @@ Make the topology and configuration explicit so the system can be deployed with 
 - The current node should be treated as `Master_3` and should use `10.62.206.207:10000` as its master endpoint.
 - Existing worker behavior remains unchanged unless a follow-up implementation explicitly needs it.
 - No new wire protocol is introduced for this design; the focus is on configuration, naming, and deployment clarity.
+- Broadcast discovery is limited to the same broadcast domain and the common coordination port `10000`.
 
 ## Proposed Design
 

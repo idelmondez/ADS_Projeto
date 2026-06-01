@@ -5,6 +5,8 @@ Date: 2026-05-18
 ## Context
 Workers must connect to a master when instantiated. If no master is reachable, the worker should search for a master via broadcast. If none is found, the existing election flow must proceed. The solution must not introduce new contracts and must avoid regressions.
 
+Assume all masters and workers are on the same wired LAN, so UDP broadcast can reach every node that should participate in discovery.
+
 ## Goals
 - Allow workers to discover a master via UDP broadcast before election.
 - Reuse the existing HEARTBEAT/ALIVE contract without adding fields.
@@ -41,6 +43,10 @@ Workers must connect to a master when instantiated. If no master is reachable, t
 - Master starts a UDP listener on 0.0.0.0:2103 in a background thread.
 - On receiving a valid HEARTBEAT payload, it responds with the existing ALIVE payload to the sender address.
 - Invalid JSON or unrelated payloads are ignored without interrupting the main TCP server.
+
+### Multi-master Discovery
+- Masters can also use the same LAN broadcast pattern to find peers on the common coordination port `10000`.
+- Discovery succeeds only within the same broadcast domain; no cross-subnet routing is assumed.
 
 ## Error Handling and Robustness
 - UDP bind failures are logged; master continues running with TCP only.
