@@ -103,6 +103,28 @@ def send_udp_json(sock, payload, addr):
     sock.sendto((json.dumps(payload) + "\n").encode(), addr)
 
 
+def send_request_help(peer_host, peer_port, workers_needed=1, timeout=5):
+    req = {
+        "type": "request_help",
+        "request_id": str(uuid.uuid4()),
+        "payload": {
+            "master_id": f"{HOST}:{MASTER_COMM_PORT}",
+            "current_load": task_queue.qsize(),
+            "capacity": CAPACITY,
+            "workers_needed": int(workers_needed),
+        },
+    }
+    try:
+        with socket.create_connection((peer_host, int(peer_port)), timeout=timeout) as s:
+            send_json_line(s, req)
+            # Wait for single-line response
+            resp = recv_json_line(s)
+            return resp
+    except Exception as e:
+        log(f"Erro ao enviar request_help para {peer_host}:{peer_port}: {e}")
+        return None
+
+
 def register_master_peer(peer_host, peer_port=MASTER_COMM_PORT):
     if not peer_host:
         return False
@@ -499,12 +521,90 @@ def handle_type_message(mensagem):
             requester_id = payload.get("master_id")
             requester_load = payload.get("current_load")
             requester_capacity = payload.get("capacity")
-
             # Calcular novo endereço do master solicitante (IP:PORT)
-            # Isso será enviado pelo handler que recebeu a requisição
-            log(f"Agendando redirecionamento de {len(offered)} workers para Master {requester_id}")
-            # O sender da requisição será responsável por informar seu endereço
-            # Por enquanto, apenas registramos a intenção
+            requester_address = requester_id or payload.get("master_address") or ""
+            log(f"Agendando redirecionamento de {len(offered)} workers para Master {requester_address}")
+
+            # Para cada worker oferecido, tente enviar comando de redirect para o servidor de controle do worker
+            for worker in offered:
+                wid = worker.get("worker_id") if isinstance(worker, dict) and "worker_id" in worker else worker.get("worker_id") if isinstance(worker, dict) else worker.get("worker_id") if hasattr(worker, "get") else None
+                # Resolve control address preferencialmente a partir do registro local
+                control_addr = None
+                with registry_lock:
+                    w = worker_registry.get(wid)
+                    if w:
+                        control_addr = w.get("control_address")
+
+                if not control_addr:
+                    log(f"Sem control_address para worker {wid}, pulando redirect (espera reconnect)")
+                    continue
+
+                # Parse control_address which may be in the form host:port or a tuple
+                host = None
+                port = None
+                if isinstance(control_addr, str) and ":" in control_addr:
+                    try:
+                        host, port_str = control_addr.rsplit(":", 1)
+                        port = int(port_str)
+                    except Exception:
+                        host = control_addr
+                        port = None
+                elif isinstance(control_addr, tuple) or isinstance(control_addr, list):
+                    host = control_addr[0]
+                    port = int(control_addr[1]) if len(control_addr) > 1 else None
+                else:
+                    host = control_addr
+
+                if not host or not port:
+                    log(f"Control address incompleto para worker {wid}: {control_addr}")
+                    continue
+
+                # Tentar conectar ao worker control e enviar command_redirect
+                try:
+                    with socket.create_connection((host, port), timeout=3) as wc:
+                        cmd = {
+                            "type": "command_redirect",
+                            "request_id": request_id,
+                            "payload": {"new_master_address": requester_address},
+                        }
+                        send_json_line(wc, cmd)
+                        # Ler ack (não obrigatório)
+                        try:
+                            data = recv_json_line(wc)
+                        except Exception:
+                            data = None
+                        log(f"Redirect enviado para worker {wid} via {host}:{port} ack={data}")
+
+                    # Atualizar registro local marcando worker como emprestado
+                    with registry_lock:
+                        if wid in worker_registry:
+                            worker_registry[wid]["borrowed"] = True
+                            worker_registry[wid]["original_master"] = f"{HOST}:{PORT}"
+
+                    with borrowed_workers_lock:
+                        borrowed_workers[wid] = f"{HOST}:{PORT}"
+
+                    # Notificar master solicitante que registramos worker temporario (RPC)
+                    if requester_address and ":" in requester_address:
+                        try:
+                            peer_host, peer_port_str = requester_address.rsplit(":", 1)
+                            peer_port = int(peer_port_str)
+                            reg_msg = {
+                                "type": "register_temporary_worker",
+                                "request_id": str(uuid.uuid4()),
+                                "payload": {"worker_id": wid, "original_master_address": f"{HOST}:{PORT}"},
+                            }
+                            with socket.create_connection((peer_host, peer_port), timeout=5) as ms:
+                                send_json_line(ms, reg_msg)
+                                try:
+                                    _ = recv_json_line(ms)
+                                except Exception:
+                                    pass
+                            log(f"Notificado master solicitante {requester_address} do worker {wid}")
+                        except Exception as e:
+                            log(f"Falha ao notificar master solicitante {requester_address}: {e}")
+                except Exception as e:
+                    log(f"Erro redirecionando worker {wid} para {requester_address}: {e}")
 
         threading.Thread(target=send_redirects, daemon=True).start()
 
