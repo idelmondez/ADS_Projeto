@@ -643,8 +643,25 @@ def iniciar_master(host, port, stop_event):
     log(f"Master iniciando em {host}:{port}")
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((host, port))
-    server.listen(5)
+    try:
+        server.bind((host, port))
+        server.listen(5)
+    except Exception as e:
+        log(f"Erro ao bind/listen em {host}:{port}: {e}")
+        # Tenta fallback para 0.0.0.0 se o bind falhar (interface inválida ou endereço não disponível)
+        try:
+            fallback_host = "0.0.0.0"
+            log(f"Tentando fallback bind em {fallback_host}:{port}")
+            server.bind((fallback_host, port))
+            server.listen(5)
+            log(f"Master escutando em fallback {fallback_host}:{port}")
+        except Exception as e2:
+            log(f"Falha no bind de fallback: {e2}")
+            try:
+                server.close()
+            except Exception:
+                pass
+            return
 
     threading.Thread(target=monitor_borrowed_workers_loop, daemon=True).start()
     threading.Thread(target=iniciar_master_comm_listener, args=(stop_event,), daemon=True).start()
@@ -668,4 +685,13 @@ def iniciar_master(host, port, stop_event):
 
 if __name__ == "__main__":
     stop_event = threading.Event()
-    iniciar_master(HOST, PORT, stop_event)
+    try:
+        iniciar_master(HOST, PORT, stop_event)
+    except Exception as e:
+        # Log com detalhe e não terminar silenciosamente
+        log(f"Exceção não tratada em iniciar_master: {e}")
+        import traceback
+
+        traceback.print_exc()
+        # Pausa curta para permitir captura de logs em ambientes que fecham janelas rapidamente
+        time.sleep(1)
