@@ -1,520 +1,408 @@
+"""
+Worker P2P - Arquitetura de Sistemas Distribuidos
+Sprints 01, 02 e 03
+
+Implementa:
+- Heartbeat periodico para o Master atual
+- Apresentacao e ciclo de tarefas
+- Execucao simulada de QUERY
+- Recebimento de command_redirect e command_release
+- Registro como Worker temporario quando emprestado
+
+Somente biblioteca padrao do Python.
+"""
+
+from __future__ import annotations
+
+import argparse
 import json
-import os
 import random
-import shutil
 import socket
 import threading
 import time
-
-import master
-
-MEU_IP = None
-PORT = 2003
-WORKER_UUID = "W-123"
-CONTROL_PORT = 2103
-MASTER = None
-MASTER_UUID = "Master_A"
-WORKERS = []
-known_workers = []
-
-DISCOVERY_PORT = 2103
-DISCOVERY_ATTEMPTS = 3
-DISCOVERY_TIMEOUT = 3
-DISCOVERY_BROADCAST_IP = "255.255.255.255"
-MASTER_FROM_ENV = False
-
-falhas = 0
-eleicao_em_andamento = False
-ORIGINAL_MASTER_ADDRESS = None
-local_master_thread = None
-local_master_stop_event = None
-state_lock = threading.Lock()
-discovery_thread = None
-discovery_result = None
-discovery_lock = threading.Lock()
+import uuid
+from datetime import datetime
+from typing import Any, Optional
 
 
-def detect_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+TASK_HEARTBEAT = "HEARTBEAT"
+TASK_QUERY = "QUERY"
+TASK_NO_TASK = "NO_TASK"
+RESPONSE_ALIVE = "ALIVE"
+STATUS_ACK = "ACK"
+STATUS_OK = "OK"
+WORKER_ALIVE = "ALIVE"
+
+TYPE_COMMAND_REDIRECT = "command_redirect"
+TYPE_REGISTER_TEMPORARY_WORKER = "register_temporary_worker"
+TYPE_COMMAND_RELEASE = "command_release"
+
+SOCKET_TIMEOUT = 5
 
 
-env_meu = os.getenv("MEU_IP")
-if env_meu:
-    MEU_IP = env_meu
-
-env_worker = os.getenv("WORKER_UUID")
-if env_worker:
-    WORKER_UUID = env_worker
-
-env_control = os.getenv("CONTROL_PORT")
-if env_control:
-    try:
-        CONTROL_PORT = int(env_control)
-    except Exception:
-        pass
-
-env_master_host = os.getenv("MASTER_HOST")
-env_master_port = os.getenv("MASTER_PORT")
-if env_master_host and env_master_port:
-    try:
-        MASTER = (env_master_host, int(env_master_port))
-        MASTER_FROM_ENV = True
-    except Exception:
-        pass
-
-if not MEU_IP:
-    MEU_IP = detect_local_ip()
-
-if MASTER is None:
-    MASTER = (MEU_IP, PORT)
+# ============================================================
+# UTILITARIOS
+# ============================================================
 
 
-def log(msg):
-    print(f"[WORKER {WORKER_UUID}] {msg}")
+def now() -> str:
+    return datetime.now().strftime("%H:%M:%S")
 
 
-def get_espaco_livre():
-    total, usado, livre = shutil.disk_usage("/")
-    return livre
+def log(worker_id: str, message: str) -> None:
+    print(f"[{now()}][WORKER {worker_id}] {message}", flush=True)
 
 
-def get_espaco_livre_mb():
-    return get_espaco_livre() // (1024 * 1024)
+def parse_address(address: str) -> tuple[str, int]:
+    if ":" not in address:
+        raise ValueError(f"Endereco invalido: {address}. Use host:porta.")
+    host, port_text = address.rsplit(":", 1)
+    return host, int(port_text)
 
 
-def send_and_receive_json(server, payload, timeout=5):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(timeout)
-        s.connect(server)
-        s.sendall((json.dumps(payload) + "\n").encode())
+def send_json_line(stream, payload: dict[str, Any]) -> None:
+    message = json.dumps(payload, ensure_ascii=False) + "\n"
+    stream.write(message.encode("utf-8"))
+    stream.flush()
 
-        data = b""
-        while b"\n" not in data:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            data += chunk
 
-        if not data:
-            return None
+def recv_json_line(stream) -> Optional[dict[str, Any]]:
+    line = stream.readline()
+    if not line:
+        return None
+    return json.loads(line.decode("utf-8"))
 
-        line = data.split(b"\n", 1)[0].decode().strip()
-        if not line:
-            return None
 
-        resp = json.loads(line)
+def make_request_id() -> str:
+    return str(uuid.uuid4())
+
+
+# ============================================================
+# WORKER
+# ============================================================
+
+
+class WorkerNode:
+    def __init__(
+        self,
+        worker_id: str,
+        original_master_id: str,
+        original_master_address: str,
+        command_host: str,
+        command_port: int,
+        advertised_host: str,
+        interval: float,
+        min_task_seconds: float,
+        max_task_seconds: float,
+    ) -> None:
+        self.worker_id = worker_id
+        self.original_master_id = original_master_id
+        self.original_master_address = original_master_address
+        self.current_master_address = original_master_address
+        self.current_master_id = original_master_id
+
+        self.command_host = command_host
+        self.command_port = command_port
+        self.advertised_host = advertised_host
+        self.worker_address = f"{advertised_host}:{command_port}"
+
+        self.interval = interval
+        self.min_task_seconds = min_task_seconds
+        self.max_task_seconds = max_task_seconds
+
+        self.borrowed = False
+        self.temporary_registered_address: Optional[str] = None
+        self.stop_event = threading.Event()
+        self.command_lock = threading.RLock()
+        self.pending_command: Optional[dict[str, Any]] = None
+
+    # --------------------------------------------------------
+    # Servidor de comandos do Worker - Sprint 03
+    # --------------------------------------------------------
+
+    def start_command_server(self) -> threading.Thread:
+        thread = threading.Thread(target=self.command_server_loop, daemon=True)
+        thread.start()
+        return thread
+
+    def command_server_loop(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((self.command_host, self.command_port))
+            server.listen(10)
+            server.settimeout(1)
+
+            log(self.worker_id, f"Servidor de comandos ativo em {self.command_host}:{self.command_port}")
+
+            while not self.stop_event.is_set():
+                try:
+                    conn, addr = server.accept()
+                except socket.timeout:
+                    continue
+
+                thread = threading.Thread(target=self.handle_command_connection, args=(conn, addr), daemon=True)
+                thread.start()
+
+    def handle_command_connection(self, conn: socket.socket, addr: tuple[str, int]) -> None:
+        conn.settimeout(SOCKET_TIMEOUT)
         try:
-            wk = resp.get("workers")
-            if wk:
-                with state_lock:
-                    known_workers.clear()
-                    for a in wk:
-                        if isinstance(a, str) and ":" in a:
-                            host, port = a.rsplit(":", 1)
-                            try:
-                                known_workers.append((host, int(port)))
-                            except Exception:
+            with conn:
+                with conn.makefile("rwb") as stream:
+                    message = recv_json_line(stream)
+                    if not isinstance(message, dict):
+                        return
+
+                    msg_type = message.get("type")
+                    if msg_type not in {TYPE_COMMAND_REDIRECT, TYPE_COMMAND_RELEASE}:
+                        log(self.worker_id, f"Comando desconhecido ignorado de {addr}: {message}")
+                        return
+
+                    with self.command_lock:
+                        self.pending_command = message
+
+                    ack = {
+                        "STATUS": STATUS_ACK,
+                        "WORKER_UUID": self.worker_id,
+                        "request_id": message.get("request_id"),
+                    }
+                    send_json_line(stream, ack)
+                    log(self.worker_id, f"Comando recebido e enfileirado: {message}")
+        except Exception as error:
+            log(self.worker_id, f"Erro no servidor de comandos: {error}")
+
+    def take_pending_command(self) -> Optional[dict[str, Any]]:
+        with self.command_lock:
+            command = self.pending_command
+            self.pending_command = None
+            return command
+
+    def apply_command(self, command: dict[str, Any]) -> None:
+        msg_type = command.get("type")
+        payload = command.get("payload", {})
+
+        if msg_type == TYPE_COMMAND_REDIRECT:
+            new_master_address = payload.get("new_master_address")
+            new_master_id = payload.get("new_master_id") or "BORROWER"
+            if not isinstance(new_master_address, str):
+                log(self.worker_id, f"command_redirect invalido: {command}")
+                return
+
+            self.current_master_address = new_master_address
+            self.current_master_id = str(new_master_id)
+            self.borrowed = True
+            self.temporary_registered_address = None
+            log(self.worker_id, f"Redirecionado para Master {self.current_master_id}@{self.current_master_address}")
+            return
+
+        if msg_type == TYPE_COMMAND_RELEASE:
+            original_master_address = payload.get("original_master_address") or self.original_master_address
+            original_master_id = payload.get("original_master_id") or self.original_master_id
+
+            self.current_master_address = str(original_master_address)
+            self.current_master_id = str(original_master_id)
+            self.borrowed = False
+            self.temporary_registered_address = None
+            log(self.worker_id, f"Liberado para retornar ao Master original {self.current_master_id}@{self.current_master_address}")
+            return
+
+    # --------------------------------------------------------
+    # Cliente Worker -> Master - Sprints 01, 02 e 03
+    # --------------------------------------------------------
+
+    def start(self) -> None:
+        command_thread = self.start_command_server()
+
+        log(self.worker_id, f"WORKER_UUID={self.worker_id}")
+        log(self.worker_id, f"Master original={self.original_master_id}@{self.original_master_address}")
+        log(self.worker_id, f"Endereco de comandos do Worker={self.worker_address}")
+        log(self.worker_id, "Pressione Ctrl+C para encerrar.")
+
+        try:
+            while not self.stop_event.is_set():
+                command = self.take_pending_command()
+                if command:
+                    self.apply_command(command)
+
+                host, port = parse_address(self.current_master_address)
+                try:
+                    with socket.create_connection((host, port), timeout=SOCKET_TIMEOUT) as client:
+                        client.settimeout(SOCKET_TIMEOUT)
+                        log(self.worker_id, f"Conectado ao Master atual {self.current_master_id}@{self.current_master_address}")
+
+                        with client.makefile("rwb") as stream:
+                            if self.borrowed and self.temporary_registered_address != self.current_master_address:
+                                self.register_temporary_worker(stream)
+                                self.temporary_registered_address = self.current_master_address
+                                # O registro temporario e um fluxo tipado independente.
+                                # Abrimos uma nova conexao para operar pelo protocolo da Sprint 02.
                                 continue
-        except Exception:
-            pass
+                            self.worker_master_loop(stream)
 
-        return resp
+                except KeyboardInterrupt:
+                    raise
+                except Exception as error:
+                    log(self.worker_id, f"Conexao com Master falhou: {error}")
+                    if self.borrowed:
+                        # Resiliencia: se o Master temporario cair, volta ao Master original.
+                        log(self.worker_id, "Como estava emprestado, retornarei ao Master original.")
+                        self.current_master_address = self.original_master_address
+                        self.current_master_id = self.original_master_id
+                        self.borrowed = False
+                        self.temporary_registered_address = None
+                    time.sleep(self.interval)
 
+        except KeyboardInterrupt:
+            log(self.worker_id, "Encerramento solicitado pelo terminal.")
+        finally:
+            self.stop_event.set()
+            command_thread.join(timeout=2)
+            log(self.worker_id, "Worker encerrado.")
 
-def discover_master_via_broadcast(
-    broadcast_ip=DISCOVERY_BROADCAST_IP,
-    port=DISCOVERY_PORT,
-    attempts=DISCOVERY_ATTEMPTS,
-    timeout=DISCOVERY_TIMEOUT,
-    master_port=None,
-):
-    if master_port is None:
-        with state_lock:
-            master_port = MASTER[1]
+    def worker_master_loop(self, stream) -> None:
+        while not self.stop_event.is_set():
+            command = self.take_pending_command()
+            if command:
+                self.apply_command(command)
+                return
 
-    payload = {"SERVER_UUID": MASTER_UUID, "TASK": "HEARTBEAT"}
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.settimeout(timeout)
-        for _ in range(attempts):
-            try:
-                s.sendto((json.dumps(payload) + "\n").encode(), (broadcast_ip, port))
-                data, addr = s.recvfrom(4096)
-            except socket.timeout:
-                continue
-            except Exception as e:
-                log(f"Erro no broadcast discovery: {e}")
-                continue
+            self.send_heartbeat(stream)
 
-            try:
-                resp = json.loads(data.decode().strip())
-            except Exception:
-                continue
+            command = self.take_pending_command()
+            if command:
+                self.apply_command(command)
+                return
 
-            if resp.get("TASK") == "HEARTBEAT" and resp.get("RESPONSE") == "ALIVE":
-                return (addr[0], master_port)
+            self.request_task_or_command(stream)
+            time.sleep(self.interval)
 
-    return None
+    def send_heartbeat(self, stream) -> None:
+        payload = {
+            "SERVER_UUID": self.current_master_id,
+            "TASK": TASK_HEARTBEAT,
+        }
+        send_json_line(stream, payload)
+        log(self.worker_id, f"Heartbeat enviado: {payload}")
 
+        response = recv_json_line(stream)
+        if response is None:
+            raise ConnectionError("Master nao respondeu ao heartbeat")
 
-def _run_discovery():
-    global discovery_result
-    result = discover_master_via_broadcast()
-    if result:
-        with discovery_lock:
-            discovery_result = result
+        if response.get("TASK") != TASK_HEARTBEAT or response.get("RESPONSE") != RESPONSE_ALIVE:
+            raise ValueError(f"Resposta invalida de heartbeat: {response}")
 
+        log(self.worker_id, f"Status ALIVE recebido: {response}")
 
-def start_discovery_thread():
-    global discovery_thread
-    with discovery_lock:
-        if discovery_thread and discovery_thread.is_alive():
-            return
-        discovery_thread = threading.Thread(target=_run_discovery, daemon=True)
-        discovery_thread.start()
-
-
-def apply_discovery_if_found():
-    global falhas, eleicao_em_andamento, discovery_result, MASTER
-    with discovery_lock:
-        result = discovery_result
-        discovery_result = None
-    if result:
-        with state_lock:
-            MASTER = result
-        falhas = 0
-        eleicao_em_andamento = False
-        log(f"Master descoberto via broadcast: {MASTER}")
-        return True
-    return False
-
-
-def registrar_legacy():
-    try:
-        log(f"Registrando no master (legacy): {MASTER}")
-        payload = {"TASK": "REGISTER", "WORKER": MEU_IP}
-        send_and_receive_json(MASTER, payload, timeout=3)
-    except Exception as e:
-        log(f"Erro ao registrar (legacy): {e}")
-
-
-def heartbeat():
-    global falhas, eleicao_em_andamento
-
-    with state_lock:
-        current_master = MASTER
-
-    try:
-        payload = {"SERVER_UUID": MASTER_UUID, "TASK": "HEARTBEAT"}
-        resposta = send_and_receive_json(current_master, payload, timeout=5)
-
-        if (
-            resposta
-            and resposta.get("SERVER_UUID")
-            and resposta.get("TASK") == "HEARTBEAT"
-            and resposta.get("RESPONSE") == "ALIVE"
-        ):
-            falhas = 0
-            eleicao_em_andamento = False
-            return True
-
-        falhas += 1
-        log(f"Heartbeat invalido. falhas={falhas} resposta={resposta}")
-        return False
-
-    except Exception as e:
-        falhas += 1
-        log(f"Falha heartbeat={falhas} erro={e}")
-        return False
-
-
-def solicitar_tarefa_e_processar():
-    global ORIGINAL_MASTER_ADDRESS
-
-    with state_lock:
-        current_master = MASTER
-        borrowed_from = ORIGINAL_MASTER_ADDRESS
-
-    payload = {
-        "WORKER": "ALIVE",
-        "WORKER_UUID": WORKER_UUID,
-        "CONTROL_ADDRESS": f"{MEU_IP}:{CONTROL_PORT}",
-    }
-    if borrowed_from:
-        payload["SERVER_UUID"] = borrowed_from
-
-    try:
-        resposta = send_and_receive_json(current_master, payload, timeout=5)
-        if not resposta:
-            return
-
-        task = resposta.get("TASK")
-        if task == "NO_TASK":
-            return
-
-        if task == "QUERY":
-            user = resposta.get("USER", "unknown")
-            process_time = random.uniform(0.5, 2.0)
-            time.sleep(process_time)
-
-            status = "OK" if random.random() > 0.1 else "NOK"
-            report = {
-                "STATUS": status,
-                "TASK": "QUERY",
-                "WORKER_UUID": WORKER_UUID,
-            }
-            ack = send_and_receive_json(current_master, report, timeout=5)
-            log(f"Task para USER={user} concluida com {status}. ACK={ack}")
-            return
-
-        log(f"Mensagem de tarefa desconhecida ignorada: {resposta}")
-
-    except Exception as e:
-        log(f"Erro no ciclo de tarefa: {e}")
-
-
-def tratar_comando_controle(mensagem):
-    global MASTER, ORIGINAL_MASTER_ADDRESS, local_master_thread, local_master_stop_event
-
-    msg_type = mensagem.get("type")
-    request_id = mensagem.get("request_id")
-    payload = mensagem.get("payload", {})
-
-    if msg_type == "command_redirect":
-        new_master_address = payload.get("new_master_address")
-        if not new_master_address or ":" not in new_master_address:
-            return {
-                "type": "error",
-                "request_id": request_id,
-                "payload": {"reason": "invalid_new_master_address"},
-            }
-
-        try:
-            host, port_str = new_master_address.rsplit(":", 1)
-            with state_lock:
-                ORIGINAL_MASTER_ADDRESS = f"{MASTER[0]}:{MASTER[1]}"
-                MASTER = (host, int(port_str))
-            log(f"Redirecionado para novo master={MASTER} origem={ORIGINAL_MASTER_ADDRESS}")
-            return {
-                "type": "redirect_ack",
-                "request_id": request_id,
-                "payload": {"status": "ACK"},
-            }
-        except Exception as e:
-            log(f"Erro ao processar command_redirect: {e}")
-            return {
-                "type": "error",
-                "request_id": request_id,
-                "payload": {"reason": f"error_processing_redirect: {str(e)}"},
-            }
-
-    if msg_type == "command_release":
-        original_master = payload.get("original_master_address")
-        if not original_master or ":" not in original_master:
-            return {
-                "type": "error",
-                "request_id": request_id,
-                "payload": {"reason": "invalid_original_master_address"},
-            }
-
-        try:
-            host, port_str = original_master.rsplit(":", 1)
-            with state_lock:
-                MASTER = (host, int(port_str))
-                ORIGINAL_MASTER_ADDRESS = None
-            log(f"Liberado para retornar ao master original={MASTER}")
-            return {
-                "type": "release_ack",
-                "request_id": request_id,
-                "payload": {"status": "ACK"},
-            }
-        except Exception as e:
-            log(f"Erro ao processar command_release: {e}")
-            return {
-                "type": "error",
-                "request_id": request_id,
-                "payload": {"reason": f"error_processing_release: {str(e)}"},
-            }
-
-    if msg_type == "announce_master":
-        master_addr = payload.get("master_address")
-        if master_addr and ":" in master_addr:
-            try:
-                host, port_str = master_addr.rsplit(":", 1)
-                with state_lock:
-                    MASTER = (host, int(port_str))
-                log(f"Announce recebido: novo master={MASTER}")
-                if local_master_thread and local_master_thread.is_alive():
-                    try:
-                        local_master_stop_event.set()
-                    except Exception:
-                        pass
-                    local_master_thread = None
-                    local_master_stop_event = None
-            except Exception as e:
-                log(f"Erro ao processar announce_master: {e}")
-
-        return {
-            "type": "announce_ack",
-            "request_id": request_id,
-            "payload": {"status": "ACK"},
+    def request_task_or_command(self, stream) -> None:
+        payload = {
+            "WORKER": WORKER_ALIVE,
+            "WORKER_UUID": self.worker_id,
+            "WORKER_HOST": self.advertised_host,  # extensao tolerada
+            "WORKER_PORT": self.command_port,     # extensao tolerada
         }
 
-    return {
-        "type": "error",
-        "request_id": request_id,
-        "payload": {"reason": "unknown_type"},
-    }
+        if self.borrowed:
+            # Compatibilidade Sprint 02: Worker emprestado informa o Master de origem.
+            payload["SERVER_UUID"] = self.original_master_id
+
+        send_json_line(stream, payload)
+        log(self.worker_id, f"Apresentacao enviada: {payload}")
+
+        response = recv_json_line(stream)
+        if response is None:
+            raise ConnectionError("Master encerrou sem responder a apresentacao")
+
+        if "type" in response:
+            self.apply_command(response)
+            return
+
+        task_type = response.get("TASK")
+        if task_type == TASK_NO_TASK:
+            log(self.worker_id, f"Master informou fila vazia: {response}")
+            return
+
+        if task_type == TASK_QUERY:
+            self.process_query(response, stream)
+            return
+
+        raise ValueError(f"Resposta de tarefa invalida: {response}")
+
+    def process_query(self, response: dict[str, Any], stream) -> None:
+        user = response.get("USER", "UNKNOWN")
+        duration = random.uniform(self.min_task_seconds, self.max_task_seconds)
+        log(self.worker_id, f"Processando QUERY para USER={user} por {duration:.2f}s")
+        time.sleep(duration)
+
+        status_payload = {
+            "STATUS": STATUS_OK,
+            "TASK": TASK_QUERY,
+            "WORKER_UUID": self.worker_id,
+        }
+        send_json_line(stream, status_payload)
+        log(self.worker_id, f"STATUS enviado: {status_payload}")
+
+        ack = recv_json_line(stream)
+        if ack is None:
+            raise ConnectionError("Master nao enviou ACK apos STATUS")
+        if ack.get("STATUS") != STATUS_ACK:
+            raise ValueError(f"ACK invalido: {ack}")
+
+        log(self.worker_id, f"ACK final recebido: {ack}")
+
+    def register_temporary_worker(self, stream) -> None:
+        payload = {
+            "type": TYPE_REGISTER_TEMPORARY_WORKER,
+            "request_id": make_request_id(),
+            "payload": {
+                "worker_id": self.worker_id,
+                "original_master_address": self.original_master_address,
+                "original_master_id": self.original_master_id,  # extensao tolerada
+                "worker_address": self.worker_address,          # extensao tolerada
+            },
+        }
+        send_json_line(stream, payload)
+        log(self.worker_id, f"register_temporary_worker enviado: {payload}")
+
+        ack = recv_json_line(stream)
+        if ack is None:
+            raise ConnectionError("Master temporario nao confirmou registro")
+        if ack.get("STATUS") != STATUS_ACK:
+            raise ValueError(f"ACK invalido no registro temporario: {ack}")
+        log(self.worker_id, f"Registro temporario confirmado: {ack}")
 
 
-def controle_listener():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((MEU_IP, CONTROL_PORT))
-    server.listen(5)
-    log(f"Canal de controle ouvindo em {MEU_IP}:{CONTROL_PORT}")
-
-    while True:
-        conn, addr = server.accept()
-        try:
-            data = b""
-            while b"\n" not in data:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-
-            if not data:
-                continue
-
-            line = data.split(b"\n", 1)[0].decode().strip()
-            if not line:
-                continue
-
-            mensagem = json.loads(line)
-            if mensagem.get("TASK") == "DISK":
-                resposta = {
-                    "FREE": get_espaco_livre(),
-                    "WORKER_UUID": WORKER_UUID,
-                    "CONTROL_PORT": CONTROL_PORT,
-                }
-            else:
-                resposta = tratar_comando_controle(mensagem)
-
-            conn.sendall((json.dumps(resposta) + "\n").encode())
-
-        except json.JSONDecodeError as e:
-            log(f"Erro ao fazer parse JSON no listener de controle: {e}")
-            try:
-                erro_resp = {"type": "error", "payload": {"reason": "json_decode_error"}}
-                conn.sendall((json.dumps(erro_resp) + "\n").encode())
-            except Exception:
-                pass
-        except Exception as e:
-            log(f"Erro no listener de controle: {e}")
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+# ============================================================
+# CLI
+# ============================================================
 
 
-def eleicao():
-    global MASTER, local_master_thread, local_master_stop_event
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Worker P2P - Sprints 01, 02 e 03")
+    parser.add_argument("--worker-id", required=True, help="Identificador unico do Worker. Ex: A1, B1")
+    parser.add_argument("--master-id", required=True, help="Master original do Worker. Ex: A, B")
+    parser.add_argument("--master-address", required=True, help="Endereco do Master original. Ex: 127.0.0.1:8000")
+    parser.add_argument("--command-host", default="127.0.0.1", help="Host em que o Worker escuta comandos")
+    parser.add_argument("--command-port", type=int, required=True, help="Porta TCP de comandos do Worker")
+    parser.add_argument("--advertised-host", default="127.0.0.1", help="Host anunciado ao Master")
+    parser.add_argument("--interval", type=float, default=2.0, help="Intervalo entre ciclos")
+    parser.add_argument("--min-task-seconds", type=float, default=1.0, help="Tempo minimo de processamento simulado")
+    parser.add_argument("--max-task-seconds", type=float, default=3.0, help="Tempo maximo de processamento simulado")
 
-    log("Iniciando eleicao")
-    candidatos = []
+    args = parser.parse_args()
+    parse_address(args.master_address)
 
-    with state_lock:
-        peers = list(known_workers)
-
-    for worker in peers:
-        try:
-            payload = {"TASK": "DISK"}
-            resposta = send_and_receive_json(worker, payload, timeout=2)
-            if resposta and "FREE" in resposta:
-                candidatos.append((worker[0], worker[1], resposta["FREE"] // (1024 * 1024)))
-        except Exception:
-            continue
-
-    candidatos.append((MEU_IP, CONTROL_PORT, get_espaco_livre_mb()))
-
-    novo_master_ip, novo_master_port, _ = max(candidatos, key=lambda x: x[2])
-    MASTER = (novo_master_ip, PORT)
-    log(f"Novo master eleito: {MASTER}")
-
-    if novo_master_ip == MEU_IP:
-        anunciar()
-        iniciar_master_local()
-    else:
-        if local_master_thread and local_master_thread.is_alive():
-            log("Nodo deixou de ser master local -> encerrando servidor local")
-            try:
-                local_master_stop_event.set()
-            except Exception:
-                pass
-            local_master_thread = None
-            local_master_stop_event = None
-
-
-def anunciar():
-    log("Anunciando novo master")
-    for worker in WORKERS:
-        try:
-            payload = {"TASK": "NEW_MASTER", "MASTER": MEU_IP}
-            send_and_receive_json(worker, payload, timeout=2)
-        except Exception:
-            continue
-
-
-def iniciar_master_local():
-    global local_master_thread, local_master_stop_event
-    log("Este no virou master")
-    if local_master_thread and local_master_thread.is_alive():
-        log("Master local ja em execucao")
-        return
-
-    stop_event = threading.Event()
-    t = threading.Thread(target=master.iniciar_master, args=(MEU_IP, PORT, stop_event), daemon=True)
-    t.start()
-    local_master_thread = t
-    local_master_stop_event = stop_event
-    log("Master local iniciado em thread")
-
-
-def main_loop():
-    global eleicao_em_andamento
-
-    registrar_legacy()
-    if not MASTER_FROM_ENV:
-        start_discovery_thread()
-
-    while True:
-        ok = heartbeat()
-
-        if not ok:
-            start_discovery_thread()
-
-        if not ok and falhas >= 4 and not eleicao_em_andamento:
-            if apply_discovery_if_found():
-                time.sleep(3)
-                continue
-            eleicao_em_andamento = True
-            eleicao()
-
-        if ok:
-            solicitar_tarefa_e_processar()
-
-        time.sleep(3)
+    worker = WorkerNode(
+        worker_id=args.worker_id,
+        original_master_id=args.master_id,
+        original_master_address=args.master_address,
+        command_host=args.command_host,
+        command_port=args.command_port,
+        advertised_host=args.advertised_host,
+        interval=args.interval,
+        min_task_seconds=args.min_task_seconds,
+        max_task_seconds=args.max_task_seconds,
+    )
+    worker.start()
 
 
 if __name__ == "__main__":
-    threading.Thread(target=controle_listener, daemon=True).start()
-    main_loop()
+    main()

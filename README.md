@@ -1,74 +1,271 @@
-# Projeto 2P2 — Atualizações e instruções
+# Sistema Distribuído P2P com Balanceamento Dinâmico de Workers
 
-Este repositório implementa um protótipo simples de master/workers com suporte a:
-- Heartbeat e ciclo de tarefas (QUERY / NO_TASK / STATUS)
-- Failover por eleição entre workers (DISK / NEW_MASTER)
-- Mensagens Master-to-Master (`type` + `request_id` + `payload`)
-- Canal de controle do worker para `command_redirect` / `command_release`
+Projeto desenvolvido para a disciplina **Arquitetura de Sistemas Distribuídos**, implementando uma arquitetura Master-Worker com comunicação P2P entre Masters, redistribuição dinâmica de Workers e monitoramento centralizado.
 
-Resumo das mudanças recentes
-- Detector automático de IP local quando `MASTER_HOST` / `MEU_IP` não forem fornecidos.
-- Workers podem ser temporariamente "emprestados" entre masters (register_temporary_worker).
-- Melhor tratamento de mensagens de controle e robustez em listeners.
-- A descoberta por broadcast assume que os nós estão na mesma rede cabeada/LAN.
+# Objetivo
 
-Arquivos principais
-- [master.py](master.py)
-- [worker.py](worker.py)
-- [test_multi_workers.py](test_multi_workers.py)
-- [test_election.py](test_election.py)
+Implementar uma fazenda distribuída de processamento composta por Masters e Workers capazes de:
 
-Configuração rápida
-
-- Variáveis de ambiente úteis:
-  - `MASTER_HOST` / `MASTER_PORT`: força o endereço do master (ex.: `MASTER_HOST=10.0.0.5`).
-  - `MEU_IP`: força o IP do worker; se ausente, o código tenta detectar o IP local automaticamente.
-  - `CONTROL_PORT`: porta do canal de controle do worker (padrão 2103).
-  - `WORKER_UUID`: identificador do worker.
-
-- Valores no código (padrões):
-  - `MASTER = None` em `worker.py` (quando `None` usa `MEU_IP:PORT` ou variáveis de ambiente).
-  - `HOST = None` em `master.py` (quando `None` o host é detectado automaticamente).
-
-Execução local
-
-1) Start manual (master separado):
-
-```
-python master.py
-```
-
-2) Start de um worker (opcionalmente via env vars para testes):
-
-```
-MEU_IP=192.168.1.10 WORKER_UUID=W-1 CONTROL_PORT=2103 MASTER_HOST=192.168.1.5 MASTER_PORT=2003 python worker.py
-```
-
-(Em Windows PowerShell, use `setx` ou prefira export via script/variáveis do processo.)
-
-Testes locais
-
-- Teste de eleição simples (inicia master + 1 worker em threads):
-
-```
-python test_election.py
-```
-
-- Teste de integração com múltiplos workers (inicia processos separados; útil para validar failover):
-
-```
-python test_multi_workers.py
-```
-
-Observações
-
-- Se `MASTER_HOST` / `MEU_IP` não forem fornecidos, o código tenta determinar o IP local usando a técnica de criar um socket UDP e consultar `getsockname()` — esse método escolhe a interface de saída padrão e funciona na maioria dos cenários de rede. Em ambientes com múltiplas interfaces ou VPNs, forneça explicitamente o IP desejado via variáveis de ambiente.
-
-- A descoberta entre masters por broadcast usa a mesma LAN cabeada e a porta comum `10000`. Em redes com VLANs, sub-redes distintas ou Wi-Fi isolado, o broadcast pode não alcançar todos os nós.
-
-- Para testes em rede real, confira firewall e regras de NAT para permitir conexões TCP na porta `2003` (masters) e nas portas `CONTROL_PORT` (workers). A porta `10000` deve ficar liberada para a comunicação entre masters na mesma LAN.
-
-- Para desenvolvimento iterativo, recomendo executar `test_multi_workers.py` localmente para validar comportamento de eleição e failover antes de distribuir entre máquinas.
+* Distribuir tarefas para Workers.
+* Monitorar disponibilidade através de Heartbeats.
+* Compartilhar Workers entre Masters quando houver sobrecarga.
+* Realizar devolução automática de Workers emprestados.
+* Reportar métricas operacionais para um Dashboard Supervisor.
 
 ---
-Atualizado: 2026-05-18 — documentação alinhada às mudanças de detecção automática de IP e testes.
+
+# Tecnologias Utilizadas
+
+* Python 3
+* Socket TCP
+* JSON
+* Threads
+* SSL/TLS
+* Biblioteca padrão do Python
+
+---
+
+# Arquitetura
+
+A solução utiliza uma arquitetura híbrida:
+
+```text
+          +----------------+
+          |   Supervisor   |
+          | Dashboard TLS  |
+          +--------+-------+
+                   ^
+                   |
+        performance_report
+                   |
+     +-------------+-------------+
+     |                           |
++----+----+                +-----+----+
+| Master A | <--------->   | Master B |
++----+----+    P2P         +-----+----+
+     |                           |
+     |                           |
++----+----+                +-----+----+
+|Worker 1 |                |Worker 2  |
++---------+                +----------+
+```
+
+---
+
+# Sprint 1
+
+## Heartbeat
+
+Implementação da comunicação Worker → Master para verificar disponibilidade.
+
+### Mensagem
+
+```json
+{
+  "TASK": "HEARTBEAT",
+  "SERVER_UUID": "A"
+}
+```
+
+### Resposta
+
+```json
+{
+  "TASK": "HEARTBEAT",
+  "RESPONSE": "ALIVE"
+}
+```
+
+---
+
+# Sprint 2
+
+## Distribuição de Tarefas
+
+O Master mantém uma fila de tarefas.
+
+Quando um Worker se conecta:
+
+1. Solicita trabalho.
+2. Recebe uma tarefa.
+3. Processa a tarefa.
+4. Retorna STATUS.
+5. Recebe ACK.
+
+Fluxo:
+
+```text
+Worker -> ALIVE
+Master -> QUERY
+Worker -> STATUS OK/NOK
+Master -> ACK
+```
+
+---
+
+# Sprint 3
+
+## Empréstimo Dinâmico de Workers
+
+Quando a fila de um Master ultrapassa sua capacidade:
+
+```text
+current_load > capacity
+```
+
+o Master solicita ajuda aos vizinhos.
+
+### request_help
+
+```json
+{
+  "type": "request_help",
+  "payload": {
+    "workers_needed": 2
+  }
+}
+```
+
+### response_accepted
+
+```json
+{
+  "type": "response_accepted"
+}
+```
+
+O Master vizinho redireciona Workers ociosos para auxiliar o Master sobrecarregado.
+
+---
+
+## Devolução Automática
+
+Quando a carga retorna ao normal:
+
+```text
+current_load <= release_threshold
+```
+
+os Workers emprestados são devolvidos ao Master original.
+
+---
+
+# Sprint 4
+
+## Monitoramento e Dashboard
+
+Cada Master envia periodicamente métricas operacionais ao Supervisor.
+
+### Intervalo
+
+```text
+10 segundos
+```
+
+### Canal
+
+```text
+TLS / SSL
+```
+
+### Tipo de Mensagem
+
+```text
+performance_report
+```
+
+### Exemplo
+
+```json
+{
+  "server_uuid": "A",
+  "role": "master",
+  "task": "performance_report",
+  "payload_version": "sprint4-monitor",
+  "performance": {
+    "farm_state": {
+      "workers": {
+        "total_registered": 2,
+        "workers_utilization": 1,
+        "workers_alive": 2,
+        "workers_idle": 1
+      },
+      "tasks": {
+        "tasks_pending": 5,
+        "tasks_completed": 20,
+        "tasks_failed": 1
+      }
+    }
+  }
+}
+```
+
+---
+
+# Execução
+
+## Master A
+
+```bash
+python master.py \
+  --master-id A \
+  --port 5000 \
+  --seed-tasks 20
+```
+
+## Master B
+
+```bash
+python master.py \
+  --master-id B \
+  --port 5001 \
+  --neighbor A=127.0.0.1:5000
+```
+
+## Worker 1
+
+```bash
+python worker.py \
+  --worker-id W1 \
+  --master-id A \
+  --master-address 127.0.0.1:5000 \
+  --command-port 6001
+```
+
+## Worker 2
+
+```bash
+python worker.py \
+  --worker-id W2 \
+  --master-id A \
+  --master-address 127.0.0.1:5000 \
+  --command-port 6002
+```
+
+---
+
+# Funcionalidades Implementadas
+
+* [x] Heartbeat Worker → Master
+* [x] Distribuição de tarefas
+* [x] ACK/NACK de processamento
+* [x] Compartilhamento de Workers
+* [x] Redirecionamento de Workers
+* [x] Devolução automática
+* [x] Monitor de carga
+* [x] Comunicação Master ↔ Master
+* [x] Monitoramento remoto
+* [x] Envio de métricas para Dashboard
+* [x] Comunicação segura TLS
+
+---
+
+# Resultados
+
+O sistema demonstrou capacidade de:
+
+* Distribuir tarefas entre Workers.
+* Detectar saturação de carga.
+* Compartilhar recursos entre Masters.
+* Recuperar Workers automaticamente.
+* Reportar métricas em tempo real para supervisão centralizada.

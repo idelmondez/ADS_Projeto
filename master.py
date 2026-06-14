@@ -1,797 +1,933 @@
+"""
+Master P2P - Arquitetura de Sistemas Distribuidos
+Sprints 01, 02 e 03
+
+Implementa:
+- Heartbeat Worker -> Master
+- Ciclo de tarefas Worker <-> Master
+- Negociacao Master -> Master para emprestimo de Workers
+- Redirecionamento e devolucao dinamica de Workers
+
+Somente biblioteca padrao do Python.
+"""
+
+from __future__ import annotations
+
+import argparse
 import json
+import math
 import queue
-import os
-import shutil
 import socket
 import threading
 import time
 import uuid
+import ssl
+import os
+from dataclasses import dataclass, field
 from datetime import datetime
-
-SERVER_UUID = "Master_A"
-HOST = None
-PORT = 2003
-DISCOVERY_PORT = 2103
-
-env_host = os.getenv("MASTER_HOST")
-env_port = os.getenv("MASTER_PORT")
-if env_host:
-    HOST = env_host
-if env_port:
-    try:
-        PORT = int(env_port)
-    except Exception:
-        pass
-
-# Auto-detect local IP when MASTER_HOST is not provided
-def detect_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+from typing import Any, Optional
 
 
-if not HOST:
-    HOST = detect_local_ip()
+# ============================================================
+# CONSTANTES DO PROTOCOLO - SPRINTS 01 E 02
+# ============================================================
 
-# Sprint 03: limiares de saturacao/histerese.
-CAPACITY = 10
-RELEASE_THRESHOLD = 6
+TASK_HEARTBEAT = "HEARTBEAT"
+TASK_QUERY = "QUERY"
+TASK_NO_TASK = "NO_TASK"
+RESPONSE_ALIVE = "ALIVE"
+STATUS_ACK = "ACK"
+STATUS_OK = "OK"
+STATUS_NOK = "NOK"
+WORKER_ALIVE = "ALIVE"
 
-# Porta de comunicacao entre masters.
-MASTER_COMM_PORT = 10000
-MASTER_DISCOVERY_ATTEMPTS = 3
-MASTER_DISCOVERY_TIMEOUT = 3
+# ============================================================
+# CONSTANTES DO PROTOCOLO - SPRINT 03
+# ============================================================
 
-# Vizinhos para negociacao P2P (master_id, ip, porta).
-NEIGHBORS = [
-    ("Master_B", "192.168.1.48", MASTER_COMM_PORT),
-]
+TYPE_REQUEST_HELP = "request_help"
+TYPE_RESPONSE_ACCEPTED = "response_accepted"
+TYPE_RESPONSE_REJECTED = "response_rejected"
+TYPE_COMMAND_REDIRECT = "command_redirect"
+TYPE_REGISTER_TEMPORARY_WORKER = "register_temporary_worker"
+TYPE_COMMAND_RELEASE = "command_release"
+TYPE_NOTIFY_WORKER_RETURNED = "notify_worker_returned"
 
-workers_ativos = set()
-MASTER_ATUAL = None
+REASON_HIGH_LOAD = "high_load"
+REASON_NO_WORKERS_AVAILABLE = "no_workers_available"
+REASON_REFUSED = "refused"
 
-task_queue = queue.Queue()
-worker_registry = {}
-registry_lock = threading.Lock()
-borrowed_workers = {}  # Rastreia workers emprestados: worker_id -> original_master_address
-borrowed_workers_lock = threading.Lock()
-known_master_peers = set()
-master_peers_lock = threading.Lock()
+SOCKET_TIMEOUT = 5
+DEFAULT_BACKLOG = 30
 
-for _, peer_host, peer_port in NEIGHBORS:
-    known_master_peers.add((peer_host, peer_port))
-
-
-def log(msg):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {msg}")
-
-
-def get_espaco_livre():
-    total, usado, livre = shutil.disk_usage("/")
-    return livre
+SUPERVISOR_HOST = "nuted-ia.dev"
+SUPERVISOR_PORT = 443
+SUPERVISOR_INTERVAL = 10
 
 
-def recv_json_line(conn):
-    data = b""
-    while b"\n" not in data:
-        chunk = conn.recv(4096)
-        if not chunk:
-            break
-        data += chunk
+# ============================================================
+# UTILITARIOS DE SOCKET/JSON
+# ============================================================
 
-    if not data:
-        return None
 
-    line = data.split(b"\n", 1)[0].decode().strip()
+def now() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def log(master_id: str, message: str) -> None:
+    print(f"[{now()}][MASTER {master_id}] {message}", flush=True)
+
+
+def parse_address(address: str) -> tuple[str, int]:
+    if ":" not in address:
+        raise ValueError(f"Endereco invalido: {address}. Use host:porta.")
+    host, port_text = address.rsplit(":", 1)
+    return host, int(port_text)
+
+
+def send_json_line(stream, payload: dict[str, Any]) -> None:
+    message = json.dumps(payload, ensure_ascii=False) + "\n"
+    stream.write(message.encode("utf-8"))
+    stream.flush()
+
+
+def recv_json_line(stream) -> Optional[dict[str, Any]]:
+    line = stream.readline()
     if not line:
         return None
-
-    return json.loads(line)
-
-
-def send_json_line(conn, payload):
-    conn.sendall((json.dumps(payload) + "\n").encode())
+    return json.loads(line.decode("utf-8"))
 
 
-def send_udp_json(sock, payload, addr):
-    sock.sendto((json.dumps(payload) + "\n").encode(), addr)
+def require_fields(payload: dict[str, Any], required: list[str]) -> Optional[str]:
+    for field_name in required:
+        if field_name not in payload:
+            return f"Campo obrigatorio ausente: {field_name}"
+    return None
 
 
-def send_request_help(peer_host, peer_port, workers_needed=1, timeout=5):
-    req = {
-        "type": "request_help",
-        "request_id": str(uuid.uuid4()),
-        "payload": {
-            "master_id": f"{HOST}:{MASTER_COMM_PORT}",
-            "current_load": task_queue.qsize(),
-            "capacity": CAPACITY,
-            "workers_needed": int(workers_needed),
-        },
-    }
-    try:
-        with socket.create_connection((peer_host, int(peer_port)), timeout=timeout) as s:
-            send_json_line(s, req)
-            # Wait for single-line response
-            resp = recv_json_line(s)
-            return resp
-    except Exception as e:
-        log(f"Erro ao enviar request_help para {peer_host}:{peer_port}: {e}")
-        return None
+def make_request_id() -> str:
+    return str(uuid.uuid4())
 
 
-def register_master_peer(peer_host, peer_port=MASTER_COMM_PORT):
-    if not peer_host:
-        return False
-
-    try:
-        peer_port = int(peer_port)
-    except Exception:
-        peer_port = MASTER_COMM_PORT
-
-    with master_peers_lock:
-        before = len(known_master_peers)
-        known_master_peers.add((peer_host, peer_port))
-        return len(known_master_peers) > before
+# ============================================================
+# ESTADO INTERNO
+# ============================================================
 
 
-def register_master_peer_from_address(master_address):
-    if not master_address:
-        return False
+@dataclass
+class WorkerState:
+    worker_id: str
+    borrowed_from_master_id: Optional[str] = None
+    borrowed_from_address: Optional[str] = None
+    worker_address: Optional[str] = None
+    busy: bool = False
+    current_task: Optional[str] = None
+    last_seen: float = field(default_factory=time.time)
 
-    if isinstance(master_address, str) and ":" in master_address:
-        host, port_str = master_address.rsplit(":", 1)
-        try:
-            port = int(port_str)
-        except Exception:
-            port = MASTER_COMM_PORT
-        return register_master_peer(host, port)
-
-    return register_master_peer(master_address, MASTER_COMM_PORT)
-
-
-def list_master_peers():
-    with master_peers_lock:
-        return sorted(known_master_peers)
+    @property
+    def is_borrowed(self) -> bool:
+        return self.borrowed_from_master_id is not None or self.borrowed_from_address is not None
 
 
-def discover_master_peers_via_broadcast(
-    broadcast_ip="255.255.255.255",
-    host="0.0.0.0",
-    port=MASTER_COMM_PORT,
-    attempts=MASTER_DISCOVERY_ATTEMPTS,
-    timeout=MASTER_DISCOVERY_TIMEOUT,
-):
-    payload = {
-        "type": "announce_master",
-        "request_id": "broadcast-discovery",
-        "payload": {"master_address": f"{HOST}:{MASTER_COMM_PORT}"},
-    }
+@dataclass
+class NeighborMaster:
+    master_id: str
+    address: str
 
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(timeout)
 
-        for _ in range(attempts):
+# ============================================================
+# MASTER
+# ============================================================
+
+
+class MasterNode:
+    def __init__(
+        self,
+        master_id: str,
+        host: str,
+        port: int,
+        capacity: int,
+        release_threshold: int,
+        seed_tasks: int,
+        neighbors: dict[str, NeighborMaster],
+        monitor_interval: float,
+    ) -> None:
+        self.master_id = master_id
+        self.host = host
+        self.port = port
+        self.address = f"{host}:{port}"
+        self.capacity = capacity
+        self.release_threshold = release_threshold
+        self.neighbors = neighbors
+        self.monitor_interval = monitor_interval
+
+        self.task_queue: queue.Queue[str] = queue.Queue()
+        for index in range(1, seed_tasks + 1):
+            self.task_queue.put(f"USER-{master_id}-{index:03d}")
+
+        self.lock = threading.RLock()
+        self.workers: dict[str, WorkerState] = {}
+        self.local_workers: set[str] = set()
+        self.borrowed_workers: dict[str, WorkerState] = {}
+        self.outgoing_loaned_workers: dict[str, str] = {}  # worker_id -> borrower_master_id
+        self.pending_worker_commands: dict[str, dict[str, Any]] = {}
+
+        self.stop_event = threading.Event()
+        self.help_in_progress = False
+        self.total_completed = 0
+        self.total_failed = 0
+
+    # --------------------------------------------------------
+    # Ciclo principal do servidor TCP
+    # --------------------------------------------------------
+
+
+    def start(self) -> None:
+        monitor_thread = threading.Thread(
+            target=self.monitor_load_loop,
+            daemon=True
+        )
+        monitor_thread.start()
+
+        supervisor_thread = threading.Thread(
+            target=self.supervisor_loop,
+            daemon=True
+        )
+        supervisor_thread.start()
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((self.host, self.port))
+            server.listen(DEFAULT_BACKLOG)
+            server.settimeout(1)
+
+            log(self.master_id, f"Escutando TCP em {self.address}")
+
             try:
-                send_udp_json(sock, payload, (broadcast_ip, port))
+                while not self.stop_event.is_set():
+                    try:
+                        conn, addr = server.accept()
+                    except socket.timeout:
+                        continue
+
+                    thread = threading.Thread(
+                        target=self.handle_connection,
+                        args=(conn, addr),
+                        daemon=True,
+                    )
+                    thread.start()
+
+            except KeyboardInterrupt:
+                log(self.master_id, "Encerramento solicitado pelo terminal.")
+
+            finally:
+                self.stop_event.set()
+                monitor_thread.join(timeout=2)
+                supervisor_thread.join(timeout=2)
+                log(self.master_id, "Servidor encerrado.")
+
+
+    def supervisor_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                self.send_performance_report()
             except Exception as e:
-                log(f"Erro ao enviar broadcast de descoberta de masters: {e}")
-                continue
+                log(self.master_id, f"Supervisor erro: {e}")
 
-            while True:
-                try:
-                    data, addr = sock.recvfrom(4096)
-                except socket.timeout:
-                    break
-                except Exception:
-                    break
-
-                try:
-                    resp = json.loads(data.decode().strip())
-                except Exception:
-                    continue
-
-                peer_address = resp.get("peer_address") or resp.get("master_address")
-                if peer_address:
-                    register_master_peer_from_address(peer_address)
-
-                register_master_peer(addr[0], port)
-
-    return list_master_peers()
+            time.sleep(SUPERVISOR_INTERVAL)
 
 
-def udp_master_discovery_listener(stop_event, host="0.0.0.0", port=MASTER_COMM_PORT):
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((host, port))
-        sock.settimeout(1.0)
-    except Exception as e:
-        log(f"Erro ao iniciar listener UDP de descoberta de masters: {e}")
-        return
-
-    while not stop_event.is_set():
-        try:
-            data, addr = sock.recvfrom(4096)
-        except socket.timeout:
-            continue
-        except Exception:
-            continue
-
-        try:
-            mensagem = json.loads(data.decode().strip())
-        except Exception:
-            continue
-
-        if mensagem.get("type") != "announce_master":
-            continue
-
-        payload = mensagem.get("payload", {})
-        if isinstance(payload, dict):
-            register_master_peer_from_address(payload.get("master_address"))
-
-        response = {
-            "type": "announce_master",
-            "request_id": mensagem.get("request_id"),
-            "master_address": f"{HOST}:{MASTER_COMM_PORT}",
-            "peer_address": f"{HOST}:{MASTER_COMM_PORT}",
-        }
-        try:
-            send_udp_json(sock, response, addr)
-        except Exception:
-            continue
-
-    try:
-        sock.close()
-    except Exception:
-        pass
-
-
-def udp_discovery_listener(stop_event, host="0.0.0.0", port=DISCOVERY_PORT):
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((host, port))
-        sock.settimeout(1.0)
-    except Exception as e:
-        log(f"Erro ao iniciar listener UDP de discovery: {e}")
-        return
-
-    while not stop_event.is_set():
-        try:
-            data, addr = sock.recvfrom(4096)
-        except socket.timeout:
-            continue
-        except Exception:
-            continue
-
-        try:
-            payload = json.loads(data.decode().strip())
-        except Exception:
-            continue
-
-        if payload.get("TASK") != "HEARTBEAT":
-            continue
-
-        response = {
-            "SERVER_UUID": SERVER_UUID,
-            "TASK": "HEARTBEAT",
-            "RESPONSE": "ALIVE",
-        }
-        try:
-            sock.sendto((json.dumps(response) + "\n").encode(), addr)
-        except Exception:
-            continue
-
-    try:
-        sock.close()
-    except Exception:
-        pass
-
-
-def handle_master_comm_client(conn, addr, peer_port=MASTER_COMM_PORT):
-    try:
-        mensagem = recv_json_line(conn)
-        if not mensagem:
-            return
-
-        register_master_peer(addr[0], peer_port)
-        payload = mensagem.get("payload", {})
-        if isinstance(payload, dict):
-            register_master_peer_from_address(payload.get("master_address"))
-
-        log(f"Conexao de master-peer {addr} mensagem={mensagem}")
-
-        if "type" not in mensagem:
-            send_json_line(
-                conn,
-                {
-                    "type": "error",
-                    "request_id": mensagem.get("request_id"),
-                    "payload": {"reason": "missing_type"},
-                },
+    def build_performance_report(self):
+        with self.lock:
+            workers_total = len(self.workers)
+            workers_borrowed = len(self.borrowed_workers)
+            workers_received = sum(
+                1 for w in self.workers.values()
+                if w.borrowed_from_master_id
             )
-            return
+            workers_busy = sum(
+                1 for w in self.workers.values()
+                if w.busy
+            )
 
-        resp = handle_type_message(mensagem)
-        send_json_line(conn, resp)
-
-    except Exception as e:
-        log(f"Erro no handle_master_comm_client: {e}")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def iniciar_master_comm_listener(stop_event, host="0.0.0.0", port=MASTER_COMM_PORT):
-    try:
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((host, port))
-        server.listen(5)
-    except Exception as e:
-        log(f"Erro ao iniciar listener de comunicacao entre masters: {e}")
-        return
-
-    log(f"Comunicação entre masters ouvindo em {host}:{port}")
-
-    while not stop_event.is_set():
-        try:
-            conn, addr = server.accept()
-            threading.Thread(
-                target=handle_master_comm_client,
-                args=(conn, addr, port),
-                daemon=True,
-            ).start()
-        except Exception as e:
-            log(f"Erro no master comm accept: {e}")
-            time.sleep(0.1)
-
-    try:
-        server.close()
-    except Exception:
-        pass
-
-
-def require_fields(payload, fields):
-    missing = [field for field in fields if field not in payload]
-    if missing:
-        return False, f"missing_fields={missing}"
-    return True, ""
-
-
-def get_next_task_for_worker(worker_id):
-    try:
-        task = task_queue.get_nowait()
-        with registry_lock:
-            if worker_id in worker_registry:
-                worker_registry[worker_id]["busy"] = True
-        return {"TASK": "QUERY", "USER": task}
-    except queue.Empty:
-        return {"TASK": "NO_TASK"}
-
-
-def handle_worker_alive_message(mensagem, addr):
-    ok, err = require_fields(mensagem, ["WORKER", "WORKER_UUID"])
-    if not ok:
-        return {"ERROR": err}
-
-    if mensagem.get("WORKER") != "ALIVE":
-        return {"ERROR": "WORKER must be ALIVE"}
-
-    worker_id = mensagem["WORKER_UUID"]
-    original_master = mensagem.get("SERVER_UUID")
-    control_address = mensagem.get("CONTROL_ADDRESS")
-
-    with registry_lock:
-        worker_registry[worker_id] = {
-            "worker_id": worker_id,
-            "borrowed": original_master is not None and original_master != SERVER_UUID,
-            "original_master": original_master,
-            "busy": False,
-            "last_seen": time.time(),
-            "addr": addr[0],
-            "control_address": control_address,
-        }
-
-    return get_next_task_for_worker(worker_id)
-
-
-def list_worker_addresses():
-    with registry_lock:
-        out = []
-        for w in worker_registry.values():
-            addr = w.get("control_address")
-            if addr:
-                out.append(addr)
-            else:
-                a = w.get("addr")
-                if a:
-                    out.append(f"{a}:{PORT}")
-        return out
-
-
-def handle_worker_status_message(mensagem):
-    ok, err = require_fields(mensagem, ["STATUS", "TASK", "WORKER_UUID"])
-    if not ok:
-        return {"ERROR": err}
-
-    status = mensagem.get("STATUS")
-    task_name = mensagem.get("TASK")
-    worker_id = mensagem.get("WORKER_UUID")
-
-    if status not in {"OK", "NOK"}:
-        return {"ERROR": "STATUS must be OK or NOK"}
-    if task_name != "QUERY":
-        return {"ERROR": "TASK must be QUERY in status report"}
-
-    with registry_lock:
-        if worker_id in worker_registry:
-            worker_registry[worker_id]["busy"] = False
-            worker_registry[worker_id]["last_seen"] = time.time()
-            borrowed = worker_registry[worker_id]["borrowed"]
-        else:
-            borrowed = False
-
-    origem = "emprestado" if borrowed else "local"
-    log(f"Status recebido: worker={worker_id} origem={origem} status={status}")
-    return {"STATUS": "ACK", "WORKER_UUID": worker_id}
-
-
-def handle_type_message(mensagem):
-    msg_type = mensagem.get("type")
-    request_id = mensagem.get("request_id")
-    payload = mensagem.get("payload", {})
-
-    if msg_type == "announce_master":
-        # Handler para anúncio de novo master (comunicação entre masters)
-        master_addr = payload.get("master_address")
-        if master_addr:
-            register_master_peer_from_address(master_addr)
-            log(f"Anúncio de novo master recebido: {master_addr}")
         return {
-            "type": "announce_ack",
-            "request_id": request_id,
-            "payload": {"status": "ACK"},
+            "server_uuid": self.master_id,
+            "hostname": socket.gethostname(),
+            "role": "master",
+            "task": "performance_report",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "message_id": str(uuid.uuid4()),
+            "payload_version": "sprint4-monitor",
+            "performance": {
+                "system": {
+                    "uptime_seconds": int(time.time()),
+                    "cpu": {
+                        "usage_percent": 0,
+                        "count_logical": os.cpu_count() or 1,
+                        "count_physical": os.cpu_count() or 1
+                    }
+                },
+                "farm_state": {
+                    "workers": {
+                        "total_registered": workers_total,
+                        "workers_utilization": workers_busy,
+                        "workers_alive": workers_total,
+                        "workers_idle": workers_total - workers_busy,
+                        "workers_borrowed": workers_borrowed,
+                        "workers_received": workers_received,
+                        "workers_failed": self.total_failed,
+                        "workers_home": len(self.local_workers),
+                        "workers_available_capacity": workers_total - workers_busy,
+                        "borrowed_workers": []
+                    },
+                    "tasks": {
+                        "tasks_pending": self.task_queue.qsize(),
+                        "tasks_running": workers_busy,
+                        "tasks_completed": self.total_completed,
+                        "tasks_failed": self.total_failed,
+                        "oldest_task_age_s": 0
+                    }
+                },
+                "config_thresholds": {
+                    "max_task": self.capacity,
+                    "warn_cpu_percent": 85,
+                    "warn_memory_percent": 85,
+                    "release_task": self.release_threshold
+                },
+                "neighbors": [
+                    {
+                        "server_uuid": n.master_id,
+                        "status": "available",
+                        "last_heartbeat": datetime.utcnow().isoformat() + "Z"
+                    }
+                    for n in self.neighbors.values()
+                ]
+            }
         }
 
-    if msg_type == "request_help":
-        ok, err = require_fields(payload, ["master_id", "current_load", "capacity", "workers_needed"])
-        if not ok:
-            return {
-                "type": "response_rejected",
-                "request_id": request_id,
-                "payload": {"reason": err},
+
+    def send_performance_report(self):
+        payload = self.build_performance_report()
+
+        context = ssl.create_default_context()
+
+        with socket.create_connection(
+            (SUPERVISOR_HOST, SUPERVISOR_PORT),
+            timeout=10
+        ) as sock:
+            with context.wrap_socket(
+                sock,
+                server_hostname=SUPERVISOR_HOST
+            ) as tls:
+                tls.sendall(
+                    (json.dumps(payload) + "\n").encode("utf-8")
+                )
+
+        log(self.master_id, "performance_report enviado")
+    def handle_connection(self, conn: socket.socket, addr: tuple[str, int]) -> None:
+        conn.settimeout(SOCKET_TIMEOUT)
+        try:
+            with conn:
+                with conn.makefile("rwb") as stream:
+                    first_payload = recv_json_line(stream)
+                    if first_payload is None:
+                        return
+
+                    if not isinstance(first_payload, dict):
+                        log(self.master_id, f"Payload ignorado de {addr}: nao e objeto JSON")
+                        return
+
+                    # SPRINT 03: mensagens envelopadas por type/request_id/payload.
+                    if "type" in first_payload:
+                        self.handle_typed_message(first_payload, stream, addr)
+                        return
+
+                    # SPRINTS 01 e 02: conexao de Worker.
+                    self.handle_worker_loop(first_payload, stream, addr)
+        except socket.timeout:
+            log(self.master_id, f"Timeout atendendo conexao {addr}")
+        except json.JSONDecodeError:
+            log(self.master_id, f"JSON invalido recebido de {addr}")
+        except ConnectionResetError:
+            log(self.master_id, f"Conexao resetada por {addr}")
+        except Exception as error:
+            log(self.master_id, f"Erro inesperado em {addr}: {error}")
+
+    # --------------------------------------------------------
+    # SPRINTS 01 E 02 - Worker <-> Master
+    # --------------------------------------------------------
+
+    def handle_worker_loop(self, first_payload: dict[str, Any], stream, addr: tuple[str, int]) -> None:
+        payload: Optional[dict[str, Any]] = first_payload
+        worker_id_for_log = "desconhecido"
+
+        while payload is not None and not self.stop_event.is_set():
+            if "TASK" in payload and payload.get("TASK") == TASK_HEARTBEAT:
+                self.handle_heartbeat(payload, stream, addr)
+
+            elif payload.get("WORKER") == WORKER_ALIVE:
+                worker_id_for_log = str(payload.get("WORKER_UUID", "desconhecido"))
+                keep_connection = self.handle_worker_presentation(payload, stream, addr)
+                if not keep_connection:
+                    return
+
+            else:
+                log(self.master_id, f"Payload Worker invalido de {addr}: {payload}")
+                return
+
+            try:
+                payload = recv_json_line(stream)
+            except socket.timeout:
+                log(self.master_id, f"Timeout aguardando proxima mensagem do Worker {worker_id_for_log}")
+                return
+
+    def handle_heartbeat(self, payload: dict[str, Any], stream, addr: tuple[str, int]) -> None:
+        expected_server_uuid = payload.get("SERVER_UUID")
+        if expected_server_uuid != self.master_id:
+            log(self.master_id, f"Heartbeat com SERVER_UUID incorreto de {addr}: {payload}")
+            response = {
+                "SERVER_UUID": self.master_id,
+                "TASK": TASK_HEARTBEAT,
+                "RESPONSE": "INVALID_REQUEST",
             }
+            send_json_line(stream, response)
+            return
 
-        with registry_lock:
-            idle_workers = [
-                worker
-                for worker in worker_registry.values()
-                if not worker["borrowed"] and not worker["busy"]
-            ]
+        response = {
+            "SERVER_UUID": self.master_id,
+            "TASK": TASK_HEARTBEAT,
+            "RESPONSE": RESPONSE_ALIVE,
+        }
+        send_json_line(stream, response)
+        log(self.master_id, f"Heartbeat respondido para {addr}: {response}")
 
+    def handle_worker_presentation(self, payload: dict[str, Any], stream, addr: tuple[str, int]) -> bool:
+        error = require_fields(payload, ["WORKER", "WORKER_UUID"])
+        if error:
+            log(self.master_id, f"Apresentacao invalida: {error}. Payload={payload}")
+            return False
+
+        if payload.get("WORKER") != WORKER_ALIVE:
+            log(self.master_id, f"Valor WORKER invalido: {payload}")
+            return False
+
+        worker_id = str(payload["WORKER_UUID"])
+        origin_master_id = payload.get("SERVER_UUID")
+        worker_address = None
+
+        # Campos extras opcionais: desconhecidos para outras equipes, mas uteis nesta demo.
+        if isinstance(payload.get("WORKER_HOST"), str) and isinstance(payload.get("WORKER_PORT"), int):
+            worker_address = f"{payload['WORKER_HOST']}:{payload['WORKER_PORT']}"
+
+        with self.lock:
+            state = self.workers.get(worker_id)
+            if state is None:
+                state = WorkerState(worker_id=worker_id)
+                self.workers[worker_id] = state
+
+            state.last_seen = time.time()
+            if worker_address:
+                state.worker_address = worker_address
+
+            if origin_master_id and origin_master_id != self.master_id:
+                state.borrowed_from_master_id = str(origin_master_id)
+                if not state.borrowed_from_address:
+                    origin = self.neighbors.get(str(origin_master_id))
+                    state.borrowed_from_address = origin.address if origin else None
+                self.borrowed_workers[worker_id] = state
+                self.local_workers.discard(worker_id)
+                origem = state.borrowed_from_master_id
+                tipo = "EMPRESTADO"
+            else:
+                if worker_id not in self.outgoing_loaned_workers:
+                    self.local_workers.add(worker_id)
+                tipo = "LOCAL"
+                origem = self.master_id
+
+            pending_command = self.pending_worker_commands.pop(worker_id, None)
+
+        if pending_command is not None:
+            send_json_line(stream, pending_command)
+            log(self.master_id, f"Comando pendente enviado ao Worker {worker_id}: {pending_command}")
+            return True
+
+        try:
+            task_user = self.task_queue.get_nowait()
+        except queue.Empty:
+            response = {"TASK": TASK_NO_TASK}
+            send_json_line(stream, response)
+            log(self.master_id, f"Worker {worker_id} ({tipo}, origem={origem}) sem tarefa: {response}")
+            return True
+
+        with self.lock:
+            state = self.workers[worker_id]
+            state.busy = True
+            state.current_task = task_user
+
+        response = {"TASK": TASK_QUERY, "USER": task_user}
+        send_json_line(stream, response)
+        log(self.master_id, f"Tarefa enviada ao Worker {worker_id} ({tipo}, origem={origem}): {response}")
+
+        try:
+            status_payload = recv_json_line(stream)
+        except socket.timeout:
+            log(self.master_id, f"Timeout aguardando STATUS do Worker {worker_id}")
+            self.mark_worker_finished(worker_id, failed=True)
+            return False
+
+        if status_payload is None:
+            log(self.master_id, f"Worker {worker_id} desconectou antes de enviar STATUS")
+            self.mark_worker_finished(worker_id, failed=True)
+            return False
+
+        self.handle_worker_status(status_payload, stream, worker_id, task_user)
+        return True
+
+    def handle_worker_status(self, payload: dict[str, Any], stream, expected_worker_id: str, task_user: str) -> None:
+        error = require_fields(payload, ["STATUS", "TASK", "WORKER_UUID"])
+        if error:
+            log(self.master_id, f"STATUS invalido do Worker {expected_worker_id}: {error}. Payload={payload}")
+            self.mark_worker_finished(expected_worker_id, failed=True)
+            return
+
+        status = payload.get("STATUS")
+        worker_id = payload.get("WORKER_UUID")
+        task = payload.get("TASK")
+
+        if worker_id != expected_worker_id or task != TASK_QUERY or status not in {STATUS_OK, STATUS_NOK}:
+            log(self.master_id, f"STATUS inconsistente recebido: {payload}")
+            self.mark_worker_finished(expected_worker_id, failed=True)
+            return
+
+        failed = status == STATUS_NOK
+        self.mark_worker_finished(expected_worker_id, failed=failed)
+
+        ack_payload = {"STATUS": STATUS_ACK, "WORKER_UUID": expected_worker_id}
+        send_json_line(stream, ack_payload)
+
+        with self.lock:
+            state = self.workers.get(expected_worker_id)
+            borrowed_info = "EMPRESTADO" if state and state.is_borrowed else "LOCAL"
+
+        log(
+            self.master_id,
+            f"STATUS {status} recebido de {expected_worker_id} ({borrowed_info}) para tarefa {task_user}; ACK enviado.",
+        )
+
+    def mark_worker_finished(self, worker_id: str, failed: bool) -> None:
+        with self.lock:
+            state = self.workers.get(worker_id)
+            if state:
+                state.busy = False
+                state.current_task = None
+                state.last_seen = time.time()
+            if failed:
+                self.total_failed += 1
+            else:
+                self.total_completed += 1
+
+    # --------------------------------------------------------
+    # SPRINT 03 - Mensagens com type/request_id/payload
+    # --------------------------------------------------------
+
+    def handle_typed_message(self, message: dict[str, Any], stream, addr: tuple[str, int]) -> None:
+        msg_type = message.get("type")
+        request_id = message.get("request_id")
+        payload = message.get("payload")
+
+        if not isinstance(msg_type, str) or not isinstance(request_id, str) or not isinstance(payload, dict):
+            log(self.master_id, f"Mensagem tipada invalida de {addr}: {message}")
+            return
+
+        log(self.master_id, f"M2M/TYPE recebido type={msg_type} request_id={request_id} payload={payload}")
+
+        if msg_type == TYPE_REQUEST_HELP:
+            response = self.handle_request_help(request_id, payload)
+            send_json_line(stream, response)
+            return
+
+        if msg_type == TYPE_NOTIFY_WORKER_RETURNED:
+            self.handle_notify_worker_returned(request_id, payload)
+            send_json_line(stream, {"STATUS": STATUS_ACK, "request_id": request_id})
+            return
+
+        if msg_type == TYPE_REGISTER_TEMPORARY_WORKER:
+            self.handle_register_temporary_worker(request_id, payload)
+            send_json_line(stream, {"STATUS": STATUS_ACK, "WORKER_UUID": payload.get("worker_id"), "request_id": request_id})
+            return
+
+        # Compatibilidade futura: tipo desconhecido deve ser logado e ignorado.
+        log(self.master_id, f"Tipo desconhecido ignorado sem derrubar processo: {msg_type}")
+
+    def handle_request_help(self, request_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        error = require_fields(payload, ["master_id", "current_load", "capacity", "workers_needed"])
+        if error:
+            log(self.master_id, f"request_help invalido: {error}. Payload={payload}")
+            return self.make_rejected_response(request_id, REASON_REFUSED)
+
+        requester_id = str(payload["master_id"])
         workers_needed = int(payload["workers_needed"])
-        high_load = task_queue.qsize() > int(CAPACITY * 0.8)
+        requester_address = payload.get("master_address")
+        if not isinstance(requester_address, str):
+            neighbor = self.neighbors.get(requester_id)
+            requester_address = neighbor.address if neighbor else None
 
-        if high_load:
-            return {
-                "type": "response_rejected",
-                "request_id": request_id,
-                "payload": {"reason": "high_load"},
+        with self.lock:
+            my_load = self.task_queue.qsize()
+            if my_load > self.capacity:
+                log(self.master_id, f"Pedido recusado: carga local alta ({my_load}>{self.capacity})")
+                return self.make_rejected_response(request_id, REASON_HIGH_LOAD)
+
+            candidates = []
+            for worker_id in sorted(self.local_workers):
+                state = self.workers.get(worker_id)
+                if not state:
+                    continue
+                if state.busy:
+                    continue
+                if worker_id in self.outgoing_loaned_workers:
+                    continue
+                candidates.append(state)
+
+            offered = candidates[: max(0, workers_needed)]
+            if not offered or requester_address is None:
+                reason = REASON_NO_WORKERS_AVAILABLE if not offered else REASON_REFUSED
+                log(self.master_id, f"Pedido recusado: reason={reason}")
+                return self.make_rejected_response(request_id, reason)
+
+            for state in offered:
+                self.outgoing_loaned_workers[state.worker_id] = requester_id
+                self.local_workers.discard(state.worker_id)
+
+        worker_details = [
+            {
+                "id": state.worker_id,
+                "address": state.worker_address or self.address,
             }
+            for state in offered
+        ]
 
-        if not idle_workers:
-            return {
-                "type": "response_rejected",
-                "request_id": request_id,
-                "payload": {"reason": "no_workers_available"},
-            }
-
-        offered = idle_workers[: max(0, workers_needed)]
-        details = []
-        for worker in offered:
-            details.append(
-                {
-                    "id": worker["worker_id"],
-                    "address": worker.get("control_address") or "",
-                }
-            )
-
-        # Armazenar informações sobre os workers sendo ofertados para posterior envio de command_redirect
-        response_msg = {
-            "type": "response_accepted",
+        response = {
+            "type": TYPE_RESPONSE_ACCEPTED,
             "request_id": request_id,
             "payload": {
-                "workers_offered": len(details),
-                "worker_details": details,
+                "workers_offered": len(offered),
+                "worker_details": worker_details,
             },
         }
 
-        # Agendar envio de command_redirect em thread separada
-        def send_redirects():
-            requester_id = payload.get("master_id")
-            requester_load = payload.get("current_load")
-            requester_capacity = payload.get("capacity")
-            # Calcular novo endereço do master solicitante (IP:PORT)
-            requester_address = requester_id or payload.get("master_address") or ""
-            log(f"Agendando redirecionamento de {len(offered)} workers para Master {requester_address}")
+        log(self.master_id, f"Pedido aceito para Master {requester_id}: {response}")
 
-            # Para cada worker oferecido, tente enviar comando de redirect para o servidor de controle do worker
-            for worker in offered:
-                wid = worker.get("worker_id") if isinstance(worker, dict) and "worker_id" in worker else worker.get("worker_id") if isinstance(worker, dict) else worker.get("worker_id") if hasattr(worker, "get") else None
-                # Resolve control address preferencialmente a partir do registro local
-                control_addr = None
-                with registry_lock:
-                    w = worker_registry.get(wid)
-                    if w:
-                        control_addr = w.get("control_address")
-
-                if not control_addr:
-                    log(f"Sem control_address para worker {wid}, pulando redirect (espera reconnect)")
-                    continue
-
-                # Parse control_address which may be in the form host:port or a tuple
-                host = None
-                port = None
-                if isinstance(control_addr, str) and ":" in control_addr:
-                    try:
-                        host, port_str = control_addr.rsplit(":", 1)
-                        port = int(port_str)
-                    except Exception:
-                        host = control_addr
-                        port = None
-                elif isinstance(control_addr, tuple) or isinstance(control_addr, list):
-                    host = control_addr[0]
-                    port = int(control_addr[1]) if len(control_addr) > 1 else None
-                else:
-                    host = control_addr
-
-                if not host or not port:
-                    log(f"Control address incompleto para worker {wid}: {control_addr}")
-                    continue
-
-                # Tentar conectar ao worker control e enviar command_redirect
-                try:
-                    with socket.create_connection((host, port), timeout=3) as wc:
-                        cmd = {
-                            "type": "command_redirect",
-                            "request_id": request_id,
-                            "payload": {"new_master_address": requester_address},
-                        }
-                        send_json_line(wc, cmd)
-                        # Ler ack (não obrigatório)
-                        try:
-                            data = recv_json_line(wc)
-                        except Exception:
-                            data = None
-                        log(f"Redirect enviado para worker {wid} via {host}:{port} ack={data}")
-
-                    # Atualizar registro local marcando worker como emprestado
-                    with registry_lock:
-                        if wid in worker_registry:
-                            worker_registry[wid]["borrowed"] = True
-                            worker_registry[wid]["original_master"] = f"{HOST}:{PORT}"
-
-                    with borrowed_workers_lock:
-                        borrowed_workers[wid] = f"{HOST}:{PORT}"
-
-                    # Notificar master solicitante que registramos worker temporario (RPC)
-                    if requester_address and ":" in requester_address:
-                        try:
-                            peer_host, peer_port_str = requester_address.rsplit(":", 1)
-                            peer_port = int(peer_port_str)
-                            reg_msg = {
-                                "type": "register_temporary_worker",
-                                "request_id": str(uuid.uuid4()),
-                                "payload": {"worker_id": wid, "original_master_address": f"{HOST}:{PORT}"},
-                            }
-                            with socket.create_connection((peer_host, peer_port), timeout=5) as ms:
-                                send_json_line(ms, reg_msg)
-                                try:
-                                    _ = recv_json_line(ms)
-                                except Exception:
-                                    pass
-                            log(f"Notificado master solicitante {requester_address} do worker {wid}")
-                        except Exception as e:
-                            log(f"Falha ao notificar master solicitante {requester_address}: {e}")
-                except Exception as e:
-                    log(f"Erro redirecionando worker {wid} para {requester_address}: {e}")
-
-        threading.Thread(target=send_redirects, daemon=True).start()
-
-        return response_msg
-
-    if msg_type == "register_temporary_worker":
-        ok, err = require_fields(payload, ["worker_id", "original_master_address"])
-        if not ok:
-            return {
-                "type": "error",
-                "request_id": request_id,
-                "payload": {"reason": err},
+        # Depois de aceitar, redireciona os Workers escolhidos para o Master solicitante.
+        for state in offered:
+            command = {
+                "type": TYPE_COMMAND_REDIRECT,
+                "request_id": make_request_id(),
+                "payload": {
+                    "new_master_address": requester_address,
+                    "new_master_id": requester_id,
+                },
             }
+            self.send_command_to_worker_or_queue(state.worker_id, command)
 
-        worker_id = payload["worker_id"]
-        original_master = payload["original_master_address"]
-        with registry_lock:
-            worker_registry[worker_id] = {
-                "worker_id": worker_id,
-                "borrowed": True,
-                "original_master": original_master,
-                "busy": False,
-                "last_seen": time.time(),
-                "addr": None,
-                "control_address": None,
-            }
+        self.print_state()
+        return response
 
-        with borrowed_workers_lock:
-            borrowed_workers[worker_id] = original_master
-
-        log(f"Worker temporario registrado: {worker_id} de {original_master}. Total emprestados: {len(borrowed_workers)}")
+    def make_rejected_response(self, request_id: str, reason: str) -> dict[str, Any]:
         return {
-            "type": "register_ack",
+            "type": TYPE_RESPONSE_REJECTED,
             "request_id": request_id,
-            "payload": {"status": "ACK"},
+            "payload": {"reason": reason},
         }
 
-    if msg_type == "notify_worker_returned":
-        worker_id = payload.get("worker_id")
-        if worker_id:
-            with registry_lock:
-                worker_registry.pop(worker_id, None)
-            with borrowed_workers_lock:
-                borrowed_workers.pop(worker_id, None)
-            log(f"Worker devolvido removido da lista local: {worker_id}. Total emprestados: {len(borrowed_workers)}")
-        return {
-            "type": "notify_ack",
-            "request_id": request_id,
-            "payload": {"status": "ACK"},
-        }
-
-    log(f"Mensagem type desconhecida ignorada: {msg_type}")
-    return {
-        "type": "error",
-        "request_id": request_id,
-        "payload": {"reason": "unknown_type"},
-    }
-
-
-def handle_legacy_message(mensagem):
-    global MASTER_ATUAL
-
-    task = mensagem.get("TASK")
-
-    if task == "HEARTBEAT":
-        return {
-            "SERVER_UUID": SERVER_UUID,
-            "TASK": "HEARTBEAT",
-            "RESPONSE": "ALIVE",
-            "workers": list_worker_addresses(),
-        }
-
-    if task == "REGISTER":
-        worker_ip = mensagem.get("WORKER")
-        if worker_ip:
-            workers_ativos.add(worker_ip)
-            log(f"Workers ativos (legacy): {workers_ativos}")
-        return {"STATUS": "REGISTERED", "workers": list_worker_addresses()}
-
-    if task == "DISK":
-        return {"FREE": get_espaco_livre()}
-
-    if task == "NEW_MASTER":
-        MASTER_ATUAL = mensagem.get("MASTER")
-        log(f"Novo master definido (legacy): {MASTER_ATUAL}")
-        return {"STATUS": "ACK"}
-
-    if mensagem.get("WORKER") == "ALIVE":
-        return handle_worker_alive_message(mensagem, ("", 0))
-
-    if task == "QUERY" and "STATUS" in mensagem:
-        return handle_worker_status_message(mensagem)
-
-    if "STATUS" in mensagem and "WORKER_UUID" in mensagem:
-        return handle_worker_status_message(mensagem)
-
-    return {"RESPONSE": "INVALID"}
-
-
-def handle_client(conn, addr):
-    try:
-        mensagem = recv_json_line(conn)
-        if not mensagem:
+    def handle_register_temporary_worker(self, request_id: str, payload: dict[str, Any]) -> None:
+        error = require_fields(payload, ["worker_id", "original_master_address"])
+        if error:
+            log(self.master_id, f"register_temporary_worker invalido: {error}. Payload={payload}")
             return
 
-        log(f"Conexao de {addr} mensagem={mensagem}")
+        worker_id = str(payload["worker_id"])
+        original_master_address = str(payload["original_master_address"])
+        original_master_id = str(payload.get("original_master_id") or "UNKNOWN_ORIGIN")
+        worker_address = payload.get("worker_address")
 
-        if "type" in mensagem:
-            resp = handle_type_message(mensagem)
-            send_json_line(conn, resp)
+        with self.lock:
+            state = self.workers.get(worker_id)
+            if state is None:
+                state = WorkerState(worker_id=worker_id)
+                self.workers[worker_id] = state
+            state.borrowed_from_master_id = original_master_id
+            state.borrowed_from_address = original_master_address
+            if isinstance(worker_address, str):
+                state.worker_address = worker_address
+            state.last_seen = time.time()
+            self.borrowed_workers[worker_id] = state
+            self.local_workers.discard(worker_id)
+
+        log(
+            self.master_id,
+            f"Worker temporario registrado: worker_id={worker_id} origem={original_master_id} endereco_origem={original_master_address}",
+        )
+        self.print_state()
+
+    def handle_notify_worker_returned(self, request_id: str, payload: dict[str, Any]) -> None:
+        error = require_fields(payload, ["worker_id"])
+        if error:
+            log(self.master_id, f"notify_worker_returned invalido: {error}. Payload={payload}")
             return
 
-        # legacy handling
-        resp = handle_legacy_message(mensagem)
-        send_json_line(conn, resp)
+        worker_id = str(payload["worker_id"])
+        with self.lock:
+            self.outgoing_loaned_workers.pop(worker_id, None)
+            self.local_workers.add(worker_id)
+            if worker_id in self.workers:
+                self.workers[worker_id].borrowed_from_master_id = None
+                self.workers[worker_id].borrowed_from_address = None
 
-    except Exception as e:
-        log(f"Erro no handle_client: {e}")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        log(self.master_id, f"Worker devolvido registrado pelo Master de origem: {worker_id}")
+        self.print_state()
 
+    # --------------------------------------------------------
+    # Envio de comandos para Workers
+    # --------------------------------------------------------
 
-def monitor_borrowed_workers_loop():
-    while True:
-        with borrowed_workers_lock:
-            for wid, orig in list(borrowed_workers.items()):
-                # Optionally implement health checks
-                pass
-        time.sleep(5)
+    def send_command_to_worker_or_queue(self, worker_id: str, command: dict[str, Any]) -> None:
+        with self.lock:
+            state = self.workers.get(worker_id)
+            worker_address = state.worker_address if state else None
 
-
-def iniciar_master(host, port, stop_event):
-    log(f"Master iniciando em {host}:{port}")
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        server.bind((host, port))
-        server.listen(5)
-    except Exception as e:
-        log(f"Erro ao bind/listen em {host}:{port}: {e}")
-        # Tenta fallback para 0.0.0.0 se o bind falhar (interface inválida ou endereço não disponível)
-        try:
-            fallback_host = "0.0.0.0"
-            log(f"Tentando fallback bind em {fallback_host}:{port}")
-            server.bind((fallback_host, port))
-            server.listen(5)
-            log(f"Master escutando em fallback {fallback_host}:{port}")
-        except Exception as e2:
-            log(f"Falha no bind de fallback: {e2}")
+        if worker_address:
             try:
-                server.close()
-            except Exception:
-                pass
+                host, port = parse_address(worker_address)
+                with socket.create_connection((host, port), timeout=SOCKET_TIMEOUT) as sock:
+                    sock.settimeout(SOCKET_TIMEOUT)
+                    with sock.makefile("rwb") as stream:
+                        send_json_line(stream, command)
+                        ack = recv_json_line(stream)
+                log(self.master_id, f"Comando enviado diretamente ao Worker {worker_id}: {command}; ACK={ack}")
+                return
+            except Exception as error:
+                log(self.master_id, f"Falha ao enviar comando direto ao Worker {worker_id}: {error}. Comando ficara pendente.")
+
+        with self.lock:
+            self.pending_worker_commands[worker_id] = command
+        log(self.master_id, f"Comando enfileirado para Worker {worker_id}: {command}")
+
+    # --------------------------------------------------------
+    # Monitoramento de saturacao, negociacao e devolucao
+    # --------------------------------------------------------
+
+    def monitor_load_loop(self) -> None:
+        while not self.stop_event.is_set():
+            time.sleep(self.monitor_interval)
+            try:
+                self.check_saturation_and_request_help()
+                self.check_release_borrowed_workers()
+            except Exception as error:
+                log(self.master_id, f"Erro no monitor de carga: {error}")
+
+    def check_saturation_and_request_help(self) -> None:
+        current_load = self.task_queue.qsize()
+        if current_load <= self.capacity:
             return
 
-    threading.Thread(target=monitor_borrowed_workers_loop, daemon=True).start()
-    threading.Thread(target=iniciar_master_comm_listener, args=(stop_event,), daemon=True).start()
-    threading.Thread(target=udp_master_discovery_listener, args=(stop_event,), daemon=True).start()
-    threading.Thread(target=udp_discovery_listener, args=(stop_event,), daemon=True).start()
-    threading.Thread(target=discover_master_peers_via_broadcast, daemon=True).start()
+        with self.lock:
+            if self.help_in_progress:
+                return
+            self.help_in_progress = True
 
-    while not stop_event.is_set():
         try:
-            conn, addr = server.accept()
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
-        except Exception as e:
-            log(f"Erro no master accept: {e}")
-            time.sleep(0.1)
+            excess = current_load - self.capacity
+            workers_needed = max(1, math.ceil(excess / max(1, self.capacity)))
+            workers_needed = min(workers_needed, 5)
+            log(
+                self.master_id,
+                f"SATURACAO detectada: current_load={current_load} capacity={self.capacity} workers_needed={workers_needed}",
+            )
 
-    try:
-        server.close()
-    except Exception:
-        pass
+            for neighbor in self.neighbors.values():
+                accepted = self.request_help_from_neighbor(neighbor, current_load, workers_needed)
+                if accepted:
+                    break
+        finally:
+            with self.lock:
+                self.help_in_progress = False
+
+    def request_help_from_neighbor(self, neighbor: NeighborMaster, current_load: int, workers_needed: int) -> bool:
+        request_id = make_request_id()
+        message = {
+            "type": TYPE_REQUEST_HELP,
+            "request_id": request_id,
+            "payload": {
+                "master_id": self.master_id,
+                "master_address": self.address,  # extensao tolerada para facilitar interoperabilidade local
+                "current_load": current_load,
+                "capacity": self.capacity,
+                "workers_needed": workers_needed,
+            },
+        }
+
+        log(self.master_id, f"Enviando request_help para {neighbor.master_id}@{neighbor.address}: request_id={request_id}")
+        try:
+            host, port = parse_address(neighbor.address)
+            with socket.create_connection((host, port), timeout=SOCKET_TIMEOUT) as sock:
+                sock.settimeout(SOCKET_TIMEOUT)
+                with sock.makefile("rwb") as stream:
+                    send_json_line(stream, message)
+                    response = recv_json_line(stream)
+        except socket.timeout:
+            log(self.master_id, f"Timeout aguardando resposta de {neighbor.master_id}; request_id descartado={request_id}")
+            return False
+        except Exception as error:
+            log(self.master_id, f"Falha ao negociar com {neighbor.master_id}: {error}")
+            return False
+
+        if not isinstance(response, dict):
+            log(self.master_id, f"Resposta invalida de {neighbor.master_id}: {response}")
+            return False
+
+        if response.get("request_id") != request_id:
+            log(self.master_id, f"Resposta com request_id incorreto. esperado={request_id} recebido={response}")
+            return False
+
+        response_type = response.get("type")
+        if response_type == TYPE_RESPONSE_ACCEPTED:
+            log(self.master_id, f"Ajuda aceita por {neighbor.master_id}: {response}")
+            return True
+
+        if response_type == TYPE_RESPONSE_REJECTED:
+            reason = response.get("payload", {}).get("reason")
+            log(self.master_id, f"Ajuda recusada por {neighbor.master_id}: reason={reason}")
+            return False
+
+        log(self.master_id, f"Tipo de resposta inesperado de {neighbor.master_id}: {response}")
+        return False
+
+    def check_release_borrowed_workers(self) -> None:
+        current_load = self.task_queue.qsize()
+        if current_load > self.release_threshold:
+            return
+
+        with self.lock:
+            borrowed = list(self.borrowed_workers.values())
+
+        if not borrowed:
+            return
+
+        log(self.master_id, f"Carga normalizada: current_load={current_load} <= release_threshold={self.release_threshold}")
+
+        for state in borrowed:
+            if state.busy:
+                continue
+            if not state.borrowed_from_address:
+                continue
+
+            command = {
+                "type": TYPE_COMMAND_RELEASE,
+                "request_id": make_request_id(),
+                "payload": {
+                    "original_master_address": state.borrowed_from_address,
+                    "original_master_id": state.borrowed_from_master_id,
+                },
+            }
+            self.send_command_to_worker_or_queue(state.worker_id, command)
+            self.notify_worker_returned(state)
+
+            with self.lock:
+                self.borrowed_workers.pop(state.worker_id, None)
+                self.workers.pop(state.worker_id, None)
+
+        self.print_state()
+
+    def notify_worker_returned(self, state: WorkerState) -> None:
+        if not state.borrowed_from_address:
+            return
+
+        message = {
+            "type": TYPE_NOTIFY_WORKER_RETURNED,
+            "request_id": make_request_id(),
+            "payload": {"worker_id": state.worker_id},
+        }
+
+        try:
+            host, port = parse_address(state.borrowed_from_address)
+            with socket.create_connection((host, port), timeout=SOCKET_TIMEOUT) as sock:
+                sock.settimeout(SOCKET_TIMEOUT)
+                with sock.makefile("rwb") as stream:
+                    send_json_line(stream, message)
+                    ack = recv_json_line(stream)
+            log(self.master_id, f"notify_worker_returned enviado para {state.borrowed_from_address}: {message}; ACK={ack}")
+        except Exception as error:
+            log(self.master_id, f"Falha ao notificar devolucao para {state.borrowed_from_address}: {error}")
+
+    # --------------------------------------------------------
+    # Observabilidade
+    # --------------------------------------------------------
+
+    def print_state(self) -> None:
+        with self.lock:
+            local = sorted(self.local_workers)
+            borrowed = sorted(self.borrowed_workers.keys())
+            loaned = dict(self.outgoing_loaned_workers)
+            pending = self.task_queue.qsize()
+            completed = self.total_completed
+            failed = self.total_failed
+
+        log(
+            self.master_id,
+            "ESTADO | "
+            f"fila={pending} concluidas={completed} falhas={failed} "
+            f"workers_locais={local} workers_emprestados={borrowed} workers_cedidos={loaned}",
+        )
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+
+def parse_neighbors(values: list[str]) -> dict[str, NeighborMaster]:
+    neighbors: dict[str, NeighborMaster] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(f"Vizinho invalido: {value}. Use MASTER_ID=host:porta")
+        master_id, address = value.split("=", 1)
+        parse_address(address)
+        neighbors[master_id] = NeighborMaster(master_id=master_id, address=address)
+    return neighbors
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Master P2P - Sprints 01, 02 e 03")
+    parser.add_argument("--master-id", required=True, help="Identificador unico do Master. Ex: A, B, Master_A")
+    parser.add_argument("--host", default="127.0.0.1", help="Host TCP do Master")
+    parser.add_argument("--port", type=int, required=True, help="Porta TCP do Master")
+    parser.add_argument("--capacity", type=int, default=5, help="Threshold de saturacao da fila")
+    parser.add_argument("--release-threshold", type=int, default=2, help="Threshold de liberacao/histerese")
+    parser.add_argument("--seed-tasks", type=int, default=0, help="Quantidade inicial de tarefas simuladas")
+    parser.add_argument(
+        "--neighbor",
+        action="append",
+        default=[],
+        help="Master vizinho no formato MASTER_ID=host:porta. Pode repetir.",
+    )
+    parser.add_argument("--monitor-interval", type=float, default=2.0, help="Intervalo do monitor de carga")
+
+    args = parser.parse_args()
+    neighbors = parse_neighbors(args.neighbor)
+
+    master = MasterNode(
+        master_id=args.master_id,
+        host=args.host,
+        port=args.port,
+        capacity=args.capacity,
+        release_threshold=args.release_threshold,
+        seed_tasks=args.seed_tasks,
+        neighbors=neighbors,
+        monitor_interval=args.monitor_interval,
+    )
+    master.start()
 
 
 if __name__ == "__main__":
-    stop_event = threading.Event()
-    try:
-        iniciar_master(HOST, PORT, stop_event)
-    except Exception as e:
-        # Log com detalhe e não terminar silenciosamente
-        log(f"Exceção não tratada em iniciar_master: {e}")
-        import traceback
-
-        traceback.print_exc()
-        # Pausa curta para permitir captura de logs em ambientes que fecham janelas rapidamente
-        time.sleep(1)
+    main()
